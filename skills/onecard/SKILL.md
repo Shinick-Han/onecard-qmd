@@ -30,7 +30,7 @@ once with the same query. Do not apply the stale packet or repeatedly probe it:
 
     knowledge consume 'padding margin' --intent 'Improve mobile card spacing' --limit 2 --budget 3500
 
-If PATH lacks the command, use C:/Users/user/.local/bin/knowledge.cmd.
+If PATH lacks the command, resolve knowledge.cmd under the user's .local/bin.
 An exact document UUID can be read directly without searching.
 
 Follow QMD's mode guidance: lexical search is useful for exact anchors; structured
