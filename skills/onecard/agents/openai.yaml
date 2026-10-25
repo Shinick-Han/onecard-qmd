@@ -1,0 +1,6 @@
+interface:
+  display_name: "저장 지식 습득·적용"
+  short_description: "명시적으로 요청할 때 QMD로 저장 지식을 찾아 현재 작업에 적용합니다"
+  default_prompt: "$knowledge-consume으로 관련 저장 지식을 꺼내 현재 작업에 적용해줘."
+policy:
+  allow_implicit_invocation: false

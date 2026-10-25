@@ -1,5 +1,12 @@
 # Changelog
 
+## One Card specialization
+
+- Add a separate JSON/stdio adapter over the upstream SDK for managed English
+  knowledge cards and source-version checks; no search/index/ranking core changes.
+- Add an explicit-use skill derived from the upstream QMD workflow and an
+  identical-corpus comparison command against the pinned upstream checkout.
+
 ## [Unreleased]
 
 ### Fixed

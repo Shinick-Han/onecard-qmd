@@ -1,5 +1,9 @@
 # QMD - Query Markup Documents
 
+> **One Card specialization:** this fork adds a small NotebookLM/Obsidian adapter
+> and an explicit-use agent skill while retaining QMD's upstream search core.
+> See [the specialization boundary and protocol](docs/ONECARD.md).
+
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
