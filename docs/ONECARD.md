@@ -4,6 +4,11 @@ This is a real fork of [tobi/qmd](https://github.com/tobi/qmd), pinned to upstre
 commit `86d2365d17fc682e491c2c53d1e4a884aee8682a` (package version 2.8.3).
 The upstream MIT license, source history, SDK, CLI, MCP, tests and skills remain.
 
+The derived skill now requests body-first, version-checked reads and explicit
+source-section attribution from the caller's One Card integration. The caller's
+current contract is `one-card-consume-v2`; its MCP launcher uses a fresh read-only
+worker per call. These are caller-side changes, not replacements for QMD search.
+
 ## Boundary
 
 - `src/onecard/bridge.ts`: a small adapter over `createStore`, `update` and

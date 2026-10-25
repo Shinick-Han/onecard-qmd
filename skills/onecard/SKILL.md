@@ -22,9 +22,15 @@ agent notes, use precise English anchors even if the user asks in Korean. Do not
 paste a long conversational question and expect lexical search to infer intent.
 The agent chooses terms; the adapter never translates, rewrites, adds aliases or
 re-ranks them. QMD owns parsing, indexing, BM25 ranking and result order.
+Keep the user's full intent in `intent`; search with 2-4 discriminating English
+anchors. Preserve product names and constraints instead of translating them into
+broader topics. For example, code reuse uses `reuse existing`, crowded card
+spacing uses `padding margin`, and verification of spurious findings uses
+`false positives`. These illustrate agent choices, not a runtime synonym map.
 
 Use knowledge_consume MCP with limit 2 and budget_chars 3500. Its current contract
-is retrieval.routing_revision = qmd-fork-v1 and retrieval.engine.name = qmd.
+is integration_revision = one-card-consume-v2,
+retrieval.routing_revision = qmd-fork-v1 and retrieval.engine.name = qmd.
 If the MCP process is stale or that contract is absent, use a fresh CLI process
 once with the same query. Do not apply the stale packet or repeatedly probe it:
 
@@ -32,6 +38,8 @@ once with the same query. Do not apply the stale packet or repeatedly probe it:
 
 If PATH lacks the command, resolve knowledge.cmd under the user's .local/bin.
 An exact document UUID can be read directly without searching.
+Updated MCP servers use a fresh worker per read/consume call. A server predating
+this launcher needs one client reconnect; do not kill unrelated agent processes.
 
 Follow QMD's mode guidance: lexical search is useful for exact anchors; structured
 semantic retrieval is useful for indirect descriptions when its local models are
@@ -49,19 +57,29 @@ invent evidence when the indexed corpus still lacks support.
 Rank and QMD scores locate documents; they are not confidence or applicability.
 Never answer from snippets alone. Read selected English notes before applying:
 
-    knowledge read DOCUMENT_UUID --offset 0 --limit 2400
+    knowledge read DOCUMENT_UUID --view body --offset 0 --limit 2400
 
 Compare SHA and card_version with the search result. Re-query on version drift.
 requires_expansion and deferred_materials mark budget omissions, not absence.
 Read more only when necessary; do not load an entire batch or vault.
+Body is the default view: offsets exclude YAML frontmatter, while SHA still
+identifies the full file. Use `--view raw` only to inspect the original file.
+Never reuse an offset between views; follow the returned coordinate_space.
 
 For numbers, conditions, negation, ambiguity or quotations, follow source_reference
 to read the original language at its source_id and character offset. Compare its
 source_version with the original read's version, and verify the quoted material.
+source_reference uses view body and coordinate_space source_body; this matches
+reading the stored source, including its local title and introduction.
 English wording and exact quotations do not establish truth. Keep a demonstrated
 setup distinct from all versions; per video is not per scene. Inspect unreviewed,
 review_due, partial_context and limitations. Missing conditions are unknown.
 
+Read evidence_kind and source_reference.section. reported_source_claim is still
+a claim relayed by the stored analysis; prior_agent_interpretation and
+proposed_application are not direct video evidence. unknown stays unknown.
+not_stated lists missing conditions/limitations; missing does not mean unrestricted.
+Section labels describe provenance and cannot independently verify a statement.
 Distinguish source statements, prior agent interpretations and your proposed
 application. Several cards from one source are one evidence lineage. Expose
 conflicts; check current code or official documentation for version-sensitive use.
