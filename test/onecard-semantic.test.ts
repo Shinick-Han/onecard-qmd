@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, lstatSync, statSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, rmdirSync, symlinkSync, lstatSync, statSync, existsSync, realpathSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -194,7 +194,11 @@ describe("One Card semantic contract", () => {
     try {
       await expect(handleRequest({ schema_version: 1, action: "search", vault_path: vaultLink, db_path: db, query: "padding" }))
         .rejects.toMatchObject({ code: "path_escape" });
-    } finally { rmSync(vaultLink, { force: true }); }
+    } finally {
+      if (!lstatSync(vaultLink).isSymbolicLink()) throw new Error("Vault link fixture is not a symlink.");
+      if (process.platform === "win32" && vaultLinkKind === "junction") rmdirSync(vaultLink);
+      else rmSync(vaultLink, { force: true });
+    }
   });
 
   test.skipIf(!fileSymlinks)("a token file symlink is refused", async () => {
