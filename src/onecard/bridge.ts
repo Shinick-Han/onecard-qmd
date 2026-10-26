@@ -27,14 +27,20 @@ export class AdapterError extends Error {
 }
 
 export type StoreSession = {
-  store: QMDStore;
+  /** Absent only before the resident store is opened. Full search never opens one itself. */
+  store?: QMDStore;
   modelPath: string;
   modelSha256: string;
   residency: "cold" | "warm";
+  expansionPath?: string;
+  expansionSha256?: string;
+  rerankPath?: string;
+  rerankSha256?: string;
 };
 
-type RetrievalMode = "lexical" | "vector" | "rrf";
+type RetrievalMode = "lexical" | "vector" | "rrf" | "full";
 type ModelPin = { path: string; sha256: string };
+type ModelRole = "embedding" | "expansion" | "rerank";
 type Hit = {
   displayPath: string;
   title: string;
@@ -142,18 +148,23 @@ function assertGguf(path: string): void {
   } finally { closeSync(fd); }
 }
 
-export async function verifyEmbedModel(pin: { path: string; sha256: string }): Promise<ModelPin> {
-  if (typeof pin.sha256 !== "string" || !HASH.test(pin.sha256)) fail("model_mismatch", "The embedding model digest is invalid.");
+export async function verifyLocalModel(pin: { path: string; sha256: string }, role: ModelRole = "embedding"): Promise<ModelPin> {
+  const kind = role === "embedding" ? "embedding model" : role === "expansion" ? "expansion model" : "rerank model";
+  if (typeof pin.sha256 !== "string" || !HASH.test(pin.sha256)) fail("model_mismatch", `The ${kind} digest is invalid.`);
   const requested = absolute(pin.path);
   guardArchive(requested);
   rejectSymlinkChain(requested);
-  if (!existsSync(requested)) fail("model_missing", "The pinned local embedding model is missing.");
+  if (!existsSync(requested)) fail("model_missing", `The pinned local ${kind} is missing.`);
   if (!lstatSync(requested).isFile()) fail("model_invalid", "The pinned model file is not a local GGUF and was left in place.");
   const path = realpathSync(requested);
   const sha256 = await sha256File(path);
-  if (sha256 !== pin.sha256) fail("model_mismatch", "The local embedding model does not match the pinned digest.");
+  if (sha256 !== pin.sha256) fail("model_mismatch", `The local ${kind} does not match the pinned digest.`);
   assertGguf(path);
   return { path, sha256 };
+}
+
+export async function verifyEmbedModel(pin: { path: string; sha256: string }): Promise<ModelPin> {
+  return verifyLocalModel(pin, "embedding");
 }
 
 function engine(mode: RetrievalMode): Record<string, unknown> {
@@ -177,22 +188,43 @@ function resolveMode(action: string, value: unknown): RetrievalMode {
     return "vector";
   }
   if (value === undefined || value === "lexical" || value === "auto") return "lexical";
-  if (value === "vector" || value === "rrf") return value;
+  if (value === "vector" || value === "rrf" || value === "full") return value;
   fail("mode_unavailable", value === "hybrid"
-    ? "Hybrid mode is not available. Use explicit rrf for lex and vector fusion without expansion or reranking."
-    : "Use an explicit lexical, vector, or rrf mode.");
+    ? "Hybrid mode is not available. Use explicit rrf for lex and vector fusion without expansion or reranking, or full for the upstream expansion and rerank pipeline."
+    : "Use an explicit lexical, vector, rrf, or full mode.");
+}
+
+function readPin(value: unknown, code: string, message: string): { path: string; sha256: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(code, message);
+  const pin = value as Record<string, unknown>;
+  if (!exactKeys(pin, ["path", "sha256"]) || typeof pin.path !== "string" || typeof pin.sha256 !== "string")
+    fail(code, message);
+  return { path: pin.path, sha256: pin.sha256 };
 }
 
 function readRequestModel(value: unknown): { path: string; sha256: string } {
-  if (!value || typeof value !== "object" || Array.isArray(value)) fail("invalid_request", "Semantic requests carry only the embedding model pin.");
+  const message = "Semantic requests carry only the embedding model pin.";
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("invalid_request", message);
   const semantic = value as Record<string, unknown>;
-  if (!exactKeys(semantic, ["embed_model"])) fail("invalid_request", "Semantic requests carry only the embedding model pin.");
-  const model = semantic.embed_model;
-  if (!model || typeof model !== "object" || Array.isArray(model)) fail("invalid_request", "Semantic requests carry only the embedding model pin.");
-  const pin = model as Record<string, unknown>;
-  if (!exactKeys(pin, ["path", "sha256"]) || typeof pin.path !== "string" || typeof pin.sha256 !== "string")
-    fail("invalid_request", "Semantic requests carry only the embedding model pin.");
-  return { path: pin.path, sha256: pin.sha256 };
+  if (!exactKeys(semantic, ["embed_model"])) fail("invalid_request", message);
+  return readPin(semantic.embed_model, "invalid_request", message);
+}
+
+function readFullModels(value: unknown): { embed: { path: string; sha256: string }; expansion: { path: string; sha256: string }; rerank: { path: string; sha256: string } } {
+  const missing = "Full retrieval requires pinned local expansion and rerank models.";
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("quality_models_missing", missing);
+  const semantic = value as Record<string, unknown>;
+  const names = new Set(["embed_model", "expansion_model", "rerank_model"]);
+  for (const key of Object.keys(semantic)) {
+    if (!names.has(key)) fail("invalid_request", "Full retrieval pins are the embed, expansion, and rerank models.");
+  }
+  if (![...names].every(key => Object.prototype.hasOwnProperty.call(semantic, key))) fail("quality_models_missing", missing);
+  const message = "Full retrieval pins are local GGUF files.";
+  return {
+    embed: readPin(semantic.embed_model, "invalid_request", message),
+    expansion: readPin(semantic.expansion_model, "invalid_request", message),
+    rerank: readPin(semantic.rerank_model, "invalid_request", message),
+  };
 }
 
 function allowFilter(allowed: string[] | undefined): MetadataFilter | undefined {
@@ -260,12 +292,22 @@ async function materialize(store: QMDStore, hit: Hit, vault: string, source: str
   return row;
 }
 
-export async function openResidentStore(db: string, source: string, modelPath: string): Promise<QMDStore> {
+export async function openResidentStore(
+  db: string,
+  source: string,
+  modelPath: string,
+  quality?: { expansionPath: string; rerankPath: string },
+): Promise<QMDStore> {
+  const models: { embed: string; generate?: string; rerank?: string } = { embed: modelPath };
+  if (quality) {
+    models.generate = quality.expansionPath;
+    models.rerank = quality.rerankPath;
+  }
   return createStore({
     dbPath: db,
     config: {
       collections: { [COLLECTION]: { path: source, pattern: "*.md" } },
-      models: { embed: modelPath },
+      models,
     },
   });
 }
@@ -310,12 +352,30 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
     query = request.query;
     limit = rawLimit;
   }
-  const wantsSemantic = action === "embed" || (action === "search" && (mode === "vector" || mode === "rrf"));
-  if (wantsSemantic && request.semantic === undefined) fail("semantic_unconfigured", "Explicit semantic operations require a local embedding model pin.");
-  if (!wantsSemantic && request.semantic !== undefined) fail("invalid_request", "Semantic model pins are only accepted for vector, rrf, and embed.");
-  const pin = wantsSemantic ? await verifyEmbedModel(readRequestModel(request.semantic)) : undefined;
-  if (pin && session && (!samePath(session.modelPath, pin.path) || session.modelSha256 !== pin.sha256))
-    fail("model_mismatch", "The request model does not match the pinned resident model.");
+  const wantsSemantic = action === "embed" || (action === "search" && (mode === "vector" || mode === "rrf" || mode === "full"));
+  if (mode === "full" && request.semantic === undefined)
+    fail("quality_models_missing", "Full retrieval requires pinned local expansion and rerank models.");
+  if (mode !== "full" && wantsSemantic && request.semantic === undefined)
+    fail("semantic_unconfigured", "Explicit semantic operations require a local embedding model pin.");
+  if (!wantsSemantic && request.semantic !== undefined)
+    fail("invalid_request", "Semantic model pins are only accepted for vector, rrf, full, and embed.");
+  let pin: ModelPin | undefined;
+  if (mode === "full") {
+    const requested = readFullModels(request.semantic);
+    pin = await verifyLocalModel(requested.embed, "embedding");
+    const expansion = await verifyLocalModel(requested.expansion, "expansion");
+    const rerank = await verifyLocalModel(requested.rerank, "rerank");
+    if (!session?.expansionPath || !session.expansionSha256 || !session.rerankPath || !session.rerankSha256)
+      fail("quality_models_missing", "Full retrieval runs on the resident server with pinned expansion and rerank models.");
+    if (!samePath(session.modelPath, pin.path) || session.modelSha256 !== pin.sha256
+        || !samePath(session.expansionPath, expansion.path) || session.expansionSha256 !== expansion.sha256
+        || !samePath(session.rerankPath, rerank.path) || session.rerankSha256 !== rerank.sha256)
+      fail("model_mismatch", "The request model does not match the pinned resident model.");
+  } else if (wantsSemantic) {
+    pin = await verifyEmbedModel(readRequestModel(request.semantic));
+    if (pin && session && (!samePath(session.modelPath, pin.path) || session.modelSha256 !== pin.sha256))
+      fail("model_mismatch", "The request model does not match the pinned resident model.");
+  }
   if (action !== "index" && !existsSync(db)) fail("index_missing", "Initialize the dedicated QMD index explicitly.");
 
   let store: QMDStore | undefined;
@@ -328,7 +388,8 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
       owned = true;
       return finish(action, "lexical", { update: await store.update({ collections: [COLLECTION] }) }, "cold", started);
     }
-    if (session) store = session.store;
+    if (session?.store) store = session.store;
+    else if (mode === "full") fail("quality_models_missing", "Full retrieval runs on the resident server with pinned expansion and rerank models.");
     else if (pin) {
       store = await openResidentStore(db, source, pin.path);
       owned = true;
@@ -336,6 +397,7 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
       store = await createStore({ dbPath: db });
       owned = true;
     }
+    if (!store) fail("quality_models_missing", "Full retrieval runs on the resident server with pinned expansion and rerank models.");
     const residency = session?.residency ?? "cold";
     const collection = (await store.listCollections()).find(item => item.name === COLLECTION);
     if (!collection || !samePath(realpathSync(collection.pwd), realpathSync(source)))
@@ -353,7 +415,7 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
         durationMs: embedded.durationMs,
       } }, residency, started);
     }
-    if (mode === "vector" || mode === "rrf") {
+    if (mode === "vector" || mode === "rrf" || mode === "full") {
       const health = await store.getStatus();
       if (health.totalDocuments > 0 && (health.needsEmbedding > 0 || !health.hasVectorIndex))
         fail("embeddings_missing", "The pinned local model has no current embeddings for this index.");
@@ -370,7 +432,9 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
             filter,
             limit,
           })).map(fromHybrid)
-        : (await store.searchLex(query, { limit, collection: COLLECTION, filter })).map(fromSearch);
+        : mode === "full"
+          ? (await store.search({ query, rerank: true, collection: COLLECTION, filter, limit })).map(fromHybrid)
+          : (await store.searchLex(query, { limit, collection: COLLECTION, filter })).map(fromSearch);
     const results = [];
     for (const hit of hits) results.push(await materialize(store, hit, vault, source));
     return finish(action, mode, { results }, residency, started);

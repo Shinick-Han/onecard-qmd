@@ -5,14 +5,19 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { isAbsolute, join, resolve } from "node:path";
 import {
   AdapterError, ENGINE, MAX_REQUEST_BYTES, UPSTREAM_COMMIT, canonicalVault, handleRequest,
-  openResidentStore, resolveGuardedFile, samePath, verifyEmbedModel, type StoreSession,
+  openResidentStore, resolveGuardedFile, samePath, verifyLocalModel, type StoreSession,
 } from "./bridge.js";
 
+type ModelPin = { path: string; sha256: string };
+type DefaultMode = "lexical" | "vector" | "rrf" | "full";
 type RuntimeConfig = {
   /** Parent argv, retained and never spawned. */
   command: readonly [string, string];
+  /** Validated and ignored. Python selects the wire mode before the request. */
+  defaultMode?: DefaultMode;
   vaultPath: string;
-  model: { path: string; sha256: string };
+  model: ModelPin;
+  quality?: { expansion: ModelPin; rerank: ModelPin };
   tokenFile: string;
   url: string;
   port: number;
@@ -26,9 +31,26 @@ export type Resident = {
 
 function fail(code: string, message: string): never { throw new AdapterError(code, message); }
 
+const HASH = /^[0-9a-f]{64}$/;
+const DEFAULT_MODES = new Set<DefaultMode>(["lexical", "vector", "rrf", "full"]);
+
 function exactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
   const present = Object.keys(record);
   return present.length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(record, key));
+}
+
+function allowedKeys(record: Record<string, unknown>, required: readonly string[], optional: readonly string[]): boolean {
+  const allowed = new Set<string>([...required, ...optional]);
+  const present = Object.keys(record);
+  return present.every(key => allowed.has(key)) && required.every(key => Object.prototype.hasOwnProperty.call(record, key));
+}
+
+function readConfigPin(value: unknown): ModelPin {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("invalid_config", "Model pin shape is not valid.");
+  const pin = value as Record<string, unknown>;
+  if (!exactKeys(pin, ["path", "sha256"]) || typeof pin.path !== "string" || typeof pin.sha256 !== "string" || !isAbsolute(pin.path) || !HASH.test(pin.sha256))
+    fail("invalid_config", "Model pin shape is not valid.");
+  return { path: pin.path, sha256: pin.sha256 };
 }
 
 function loadConfig(configPath: string): RuntimeConfig {
@@ -41,21 +63,29 @@ function loadConfig(configPath: string): RuntimeConfig {
   const record = parsed as Record<string, unknown>;
   if (!Object.prototype.hasOwnProperty.call(record, "semantic"))
     fail("semantic_unconfigured", "Resident mode requires an enabled local semantic configuration.");
-  if (!exactKeys(record, ["schema_version", "upstream_commit", "command", "semantic"]))
+  if (!allowedKeys(record, ["schema_version", "upstream_commit", "command", "semantic"], ["default_mode"]))
     fail("invalid_config", "Runtime config shape is not valid.");
   if (record.schema_version !== 1) fail("invalid_config", "Runtime config schema is not supported.");
   if (record.upstream_commit !== UPSTREAM_COMMIT) fail("upstream_mismatch", "Runtime config does not match the pinned upstream commit.");
+  let defaultMode: DefaultMode | undefined;
+  if (Object.prototype.hasOwnProperty.call(record, "default_mode")) {
+    if (typeof record.default_mode !== "string" || !DEFAULT_MODES.has(record.default_mode as DefaultMode))
+      fail("invalid_config", "default_mode must be lexical, vector, rrf, or full.");
+    defaultMode = record.default_mode as DefaultMode;
+  }
   const command = loadCommand(record.command);
   const semantic = record.semantic;
   if (!semantic || typeof semantic !== "object" || Array.isArray(semantic)) fail("invalid_config", "Semantic config shape is not valid.");
   const semanticRecord = semantic as Record<string, unknown>;
-  if (!exactKeys(semanticRecord, ["enabled", "vault_path", "embed_model", "resident"]) || semanticRecord.enabled !== true)
+  if (!allowedKeys(semanticRecord, ["enabled", "vault_path", "embed_model", "resident"], ["expansion_model", "rerank_model"]) || semanticRecord.enabled !== true)
     fail("invalid_config", "Semantic config must be explicitly enabled.");
-  const model = semanticRecord.embed_model;
-  if (!model || typeof model !== "object" || Array.isArray(model)) fail("invalid_config", "Semantic config shape is not valid.");
-  const modelRecord = model as Record<string, unknown>;
-  if (!exactKeys(modelRecord, ["path", "sha256"]) || typeof modelRecord.path !== "string" || typeof modelRecord.sha256 !== "string")
-    fail("invalid_config", "Semantic config shape is not valid.");
+  const hasExpansion = Object.prototype.hasOwnProperty.call(semanticRecord, "expansion_model");
+  const hasRerank = Object.prototype.hasOwnProperty.call(semanticRecord, "rerank_model");
+  if (hasExpansion !== hasRerank) fail("invalid_config", "Expansion and rerank models are pinned together.");
+  const model = readConfigPin(semanticRecord.embed_model);
+  const quality = hasExpansion && hasRerank
+    ? { expansion: readConfigPin(semanticRecord.expansion_model), rerank: readConfigPin(semanticRecord.rerank_model) }
+    : undefined;
   const resident = semanticRecord.resident;
   if (!resident || typeof resident !== "object" || Array.isArray(resident)) fail("invalid_config", "Resident config shape is not valid.");
   const residentRecord = resident as Record<string, unknown>;
@@ -67,8 +97,10 @@ function loadConfig(configPath: string): RuntimeConfig {
   if (typeof semanticRecord.vault_path !== "string") fail("invalid_config", "Semantic config shape is not valid.");
   return {
     command,
+    defaultMode,
     vaultPath: semanticRecord.vault_path,
-    model: { path: modelRecord.path, sha256: modelRecord.sha256 },
+    model,
+    quality,
     tokenFile: residentRecord.token_file,
     url: residentRecord.url,
     port,
@@ -180,7 +212,15 @@ function readBody(req: IncomingMessage): Promise<string> {
 export async function startResident(configPath: string): Promise<Resident> {
   const config = loadConfig(configPath);
   // Parent setup owns this argv. The array is retained and never passed to a process.
-  const pinned = await verifyEmbedModel(config.model);
+  // defaultMode is validated above and is not applied to wire mode "auto".
+  void config.defaultMode;
+  const pinned = await verifyLocalModel(config.model, "embedding");
+  const quality = config.quality
+    ? {
+        expansion: await verifyLocalModel(config.quality.expansion, "expansion"),
+        rerank: await verifyLocalModel(config.quality.rerank, "rerank"),
+      }
+    : undefined;
   const vault = canonicalVault(config.vaultPath);
   readToken(config.tokenFile);
   const source = join(vault, "AgentNotes", "Atoms");
@@ -195,16 +235,28 @@ export async function startResident(configPath: string): Promise<Resident> {
   };
 
   const health = async (): Promise<Record<string, unknown>> => {
-    const model = await verifyEmbedModel(config.model);
+    const model = await verifyLocalModel(config.model, "embedding");
     if (model.sha256 !== pinned.sha256 || !samePath(model.path, pinned.path))
       fail("model_mismatch", "The local embedding model does not match the pinned digest.");
-    return {
+    const body: Record<string, unknown> = {
       schema_version: 1,
       status: "ok",
       vault_path: canonicalVault(config.vaultPath),
       embed_model_sha256: model.sha256,
       engine: { ...ENGINE },
     };
+    if (quality && config.quality) {
+      const expansion = await verifyLocalModel(config.quality.expansion, "expansion");
+      const rerank = await verifyLocalModel(config.quality.rerank, "rerank");
+      if (expansion.sha256 !== quality.expansion.sha256 || !samePath(expansion.path, quality.expansion.path)
+          || rerank.sha256 !== quality.rerank.sha256 || !samePath(rerank.path, quality.rerank.path))
+        fail("model_mismatch", "The local quality model does not match the pinned digest.");
+      body.quality_models = {
+        expansion_model_sha256: expansion.sha256,
+        rerank_model_sha256: rerank.sha256,
+      };
+    }
+    return body;
   };
 
   const serveRpc = (value: unknown): Promise<Record<string, unknown>> => exclusive(async () => {
@@ -217,16 +269,28 @@ export async function startResident(configPath: string): Promise<Resident> {
     if (!samePath(requestVault, vault)) fail("vault_mismatch", "The request vault does not match the resident configuration.");
     if (typeof record.db_path !== "string" || !isAbsolute(record.db_path) || !samePath(resolve(record.db_path), dedicatedDb))
       fail("invalid_db", "Use the dedicated vault QMD index.");
-    if (!statExists(dedicatedDb)) return handleRequest(value);
+    const session = (residency: "cold" | "warm", openedStore?: StoreSession["store"]): StoreSession => ({
+      store: openedStore,
+      modelPath: pinned.path,
+      modelSha256: pinned.sha256,
+      residency,
+      ...(quality ? {
+        expansionPath: quality.expansion.path,
+        expansionSha256: quality.expansion.sha256,
+        rerankPath: quality.rerank.path,
+        rerankSha256: quality.rerank.sha256,
+      } : {}),
+    });
+    if (!statExists(dedicatedDb)) return handleRequest(value, session("cold"));
     let created = false;
     if (!store) {
-      store = await openResidentStore(dedicatedDb, source, pinned.path);
+      store = await openResidentStore(dedicatedDb, source, pinned.path, quality
+        ? { expansionPath: quality.expansion.path, rerankPath: quality.rerank.path }
+        : undefined);
       opened += 1;
       created = true;
     }
-    return handleRequest(value, {
-      store, modelPath: pinned.path, modelSha256: pinned.sha256, residency: created ? "cold" : "warm",
-    });
+    return handleRequest(value, session(created ? "cold" : "warm", store));
   });
 
   const onRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {

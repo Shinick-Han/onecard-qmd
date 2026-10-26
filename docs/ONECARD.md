@@ -11,10 +11,12 @@ worker per call. These are caller-side changes, not replacements for QMD search.
 
 ## Boundary
 
-- `src/onecard/bridge.ts`: a small adapter over `createStore`, `update` and
-  `searchLex`. No query translation, ranking, synonym expansion, graph algorithm
-  or direct database writes.
-- `src/onecard/cli.ts`: one JSON request on stdin; one response on stdout.
+- `src/onecard/bridge.ts`: adapter over the SDK. `lexical`, `vector`, and `rrf`
+  use the query as written. `full` calls upstream `store.search` with expansion
+  and reranking. No custom ranking and no direct database writes.
+- `src/onecard/cli.ts`: one JSON request on stdin, or `--serve --config` for the
+  loopback resident. A query does not embed the corpus, download a model, or
+  start that process.
 - `skills/onecard`: an explicitly invoked adaptation of the upstream QMD skill.
 - `test/onecard.test.ts`: real temporary-file SDK integration and boundary checks.
 - `scripts/onecard-compare.mjs`: compare an untouched upstream checkout against
@@ -28,13 +30,14 @@ human study views. The adapter does not claim that translated text is verified.
 
 Run `bun dist/onecard/cli.js` after `bun install --frozen-lockfile` and
 `bun run build`. Send a JSON object with `schema_version:1`, action
-`index|search|status`, and absolute `vault_path` and `db_path`.
+`index|search|status|embed`, and absolute `vault_path` and `db_path`.
 The database must be `VAULT/.knowledge/qmd/index.sqlite`; the only collection is
 `VAULT/AgentNotes/Atoms/*.md`, named `one-card-atoms`.
 
-`index` is an explicit authorized ingestion operation. It uses QMD's SDK, does
-not run collection update hooks or source commands, and does not embed or infer.
-`search` and `status` require an existing initialized index and never reindex.
+`index` and `embed` are explicit authorized operations. `index` uses QMD's SDK,
+does not run collection update hooks or source commands, and does not embed.
+`search` and `status` require an existing initialized index and never reindex,
+embed, download, or start the resident.
 The separate application ingestion hook updates the index when card file hashes
 change. A query does not repair a stale index by itself.
 
@@ -49,10 +52,21 @@ expose those indexed versions, native docid/score/hash, and a fresh LF-normalize
 file SHA-256. The application rejects stale versions, changed files and inactive
 source dependencies without re-ranking the surviving results.
 
-Only `lexical` mode is enabled by this adapter. The original QMD vector, hybrid
-and reranking implementations remain available upstream; they require explicit
-local-model preparation and have not been validated by this lexical migration.
-Unsupported modes fail clearly, with no hidden substitute engine.
+Unset mode and native `auto` are lexical. Optional top-level `default_mode`
+(`lexical`, `vector`, `rrf`, or `full`) is applied by the parent before the
+request. `auto` is not a config value. `hybrid` fails with `mode_unavailable`.
+
+- `lexical`: `searchLex` of the query as written.
+- `vector`: `searchVector` of that same query, without expansion or rerank.
+- `rrf`: lex plus vector fusion of that same query with rerank off.
+- `full`: `store.search({ query, rerank: true })`, the upstream expansion and
+  rerank pipeline. Scores stay that pipeline's native scores.
+
+`vector`, `rrf`, and `full` require current embeddings. Semantic config may add
+only `expansion_model` and `rerank_model`, together. `full` needs both; a missing
+pin is `quality_models_missing`, not a lexical fallback. Maintenance settings
+belong in `qmd-maintenance.json`, not in semantic keys. Real GGUF inference was
+not run here.
 
 ## Updating and validating
 

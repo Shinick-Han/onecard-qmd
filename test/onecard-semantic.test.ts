@@ -53,14 +53,28 @@ function contractCommand(): [string, string] {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   return [process.execPath, join(root, "dist", "onecard", "cli.js")];
 }
-function writeConfig(port: number, tokenFile: string, model: { path: string; sha256: string }, command: readonly string[] = contractCommand()) {
+function writeConfig(
+  port: number,
+  tokenFile: string,
+  model: { path: string; sha256: string },
+  command: readonly string[] = contractCommand(),
+  extra: { defaultMode?: string; expansion?: { path: string; sha256: string }; rerank?: { path: string; sha256: string }; unknown?: boolean } = {},
+) {
   const path = join(vault, `runtime-${port}.json`);
-  writeFileSync(path, JSON.stringify({
-    schema_version: 1, upstream_commit: UPSTREAM_COMMIT, command,
-    semantic: { enabled: true, vault_path: vault, embed_model: model,
-      resident: { url: `http://127.0.0.1:${port}`, token_file: tokenFile } },
-  }));
+  const semantic: Record<string, unknown> = {
+    enabled: true, vault_path: vault, embed_model: model,
+    resident: { url: `http://127.0.0.1:${port}`, token_file: tokenFile },
+  };
+  if (extra.expansion) semantic.expansion_model = extra.expansion;
+  if (extra.rerank) semantic.rerank_model = extra.rerank;
+  if (extra.unknown) semantic.extra = true;
+  const body: Record<string, unknown> = { schema_version: 1, upstream_commit: UPSTREAM_COMMIT, command, semantic };
+  if (extra.defaultMode !== undefined) body.default_mode = extra.defaultMode;
+  writeFileSync(path, JSON.stringify(body));
   return path;
+}
+function fullSemantic(embed: { path: string; sha256: string }, expansion: { path: string; sha256: string }, rerank: { path: string; sha256: string }) {
+  return { embed_model: embed, expansion_model: expansion, rerank_model: rerank };
 }
 async function boot(model: { path: string; sha256: string }, command?: readonly string[]): Promise<{ resident: Resident; port: number }> {
   const port = await freePort();
@@ -215,8 +229,8 @@ describe("One Card semantic contract", () => {
     const verified = realpathSync(model.path);
     const real = await openResidentStore(db, source, verified);
     const calls: string[] = [];
-    let vectorArgs: { query?: string; options?: { collection?: string; limit?: number; filter?: unknown } } = {};
-    let rrfArgs: { queries?: { type: string; query: string }[]; rerank?: boolean; intent?: string } = {};
+    let vectorArgs: { query?: string; options?: { collection?: string | string[]; limit?: number; filter?: unknown } } = {};
+    let rrfArgs: { queries?: { type: string; query: string }[]; rerank?: boolean; intent?: string; collection?: string; filter?: unknown; limit?: number } = {};
     const lex = await real.searchLex("padding margin", { collection: COLLECTION, limit: 2 });
     const hit = lex.find(item => item.displayPath.endsWith(two + ".md"));
     if (!hit) throw new Error("Missing synthetic hit");
@@ -326,6 +340,142 @@ describe("One Card semantic contract", () => {
       expect(calls).not.toContain("update");
       expect(calls).not.toContain("close");
     } finally { await real.close(); }
+  });
+
+  test("full calls upstream search with the query and rerank enabled", async () => {
+    await request("index");
+    const lexicalIds = idsOf(await request("search", { query: "padding margin", limit: 2 }));
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
+    const expansion = modelFile("expand.gguf", "GGUF-expansion");
+    const rerank = modelFile("rerank.gguf", "GGUF-rerank");
+    const verified = realpathSync(model.path);
+    const real = await openResidentStore(db, source, verified, {
+      expansionPath: realpathSync(expansion.path), rerankPath: realpathSync(rerank.path),
+    });
+    expect(real.internal.llm?.embedModelName).toBe(verified);
+    expect(real.internal.llm?.generateModelName).toBe(realpathSync(expansion.path));
+    expect(real.internal.llm?.rerankModelName).toBe(realpathSync(rerank.path));
+    const calls: string[] = [];
+    let fullArgs: { query?: string; queries?: unknown; rerank?: boolean; intent?: string; collection?: string; filter?: unknown; limit?: number } = {};
+    const lex = await real.searchLex("padding margin", { collection: COLLECTION, limit: 2 });
+    const hit = lex.find(item => item.displayPath.endsWith(two + ".md"));
+    if (!hit) throw new Error("Missing synthetic hit");
+    const session = (store: QMDStore): StoreSession => ({
+      store, modelPath: verified, modelSha256: model.sha256, residency: "warm",
+      expansionPath: realpathSync(expansion.path), expansionSha256: expansion.sha256,
+      rerankPath: realpathSync(rerank.path), rerankSha256: rerank.sha256,
+    });
+    const wrapped: QMDStore = {
+      ...real,
+      close: async () => { calls.push("close"); },
+      getStatus: async () => ({ totalDocuments: 2, needsEmbedding: 0, hasVectorIndex: true, pendingMetadata: 0, collections: [] }),
+      search: async options => {
+        calls.push("search");
+        fullArgs = options;
+        return [{ file: hit.filepath, displayPath: hit.displayPath, title: hit.title, body: hit.body ?? "",
+          bestChunk: "", bestChunkPos: 0, score: 0.77, context: null, docid: hit.docid, metadata: hit.metadata }];
+      },
+      searchLex: async () => { calls.push("searchLex"); throw new Error("lexical fallback"); },
+      searchVector: async () => { calls.push("searchVector"); throw new Error("vector fallback"); },
+      embed: async () => { calls.push("embed"); throw new Error("embed"); },
+      update: async () => { calls.push("update"); throw new Error("update"); },
+      expandQuery: async () => { calls.push("expandQuery"); throw new Error("expand"); },
+    };
+    try {
+      const full = await handleRequest({
+        schema_version: 1, action: "search", mode: "full", vault_path: vault, db_path: db,
+        query: "padding margin", limit: 2, allowed_ids: [two], semantic: fullSemantic(model, expansion, rerank),
+      }, session(wrapped));
+      const row = (full.results as { id: string; score: number; indexed_review_status?: string }[])[0];
+      expect(row?.id).toBe(two);
+      expect(row?.score).toBe(0.77);
+      expect(row?.indexed_review_status).toBe("unreviewed");
+      expect((full.engine as { mode: string; adapter_revision: string; remote_model_calls: number }).mode).toBe("full");
+      expect((full.engine as { adapter_revision: string }).adapter_revision).toBe("onecard-qmd-v2");
+      expect((full.engine as { remote_model_calls: number }).remote_model_calls).toBe(0);
+      expect(fullArgs).toEqual({
+        query: "padding margin", rerank: true, collection: COLLECTION,
+        filter: { field: "permalink", operator: "in", value: [`knowledge/${two}`] }, limit: 2,
+      });
+      expect(fullArgs.queries).toBeUndefined();
+      expect(fullArgs.intent).toBeUndefined();
+      expect(calls).toEqual(["search"]);
+      calls.length = 0;
+      const empty = await handleRequest({
+        schema_version: 1, action: "search", mode: "full", vault_path: vault, db_path: db,
+        query: "padding", allowed_ids: [], semantic: fullSemantic(model, expansion, rerank),
+      }, session(wrapped));
+      expect(empty.results).toEqual([]);
+      expect(calls).toEqual([]);
+      wrapped.getStatus = async () => ({ totalDocuments: 2, needsEmbedding: 1, hasVectorIndex: false, pendingMetadata: 0, collections: [] });
+      await expect(handleRequest({
+        schema_version: 1, action: "search", mode: "full", vault_path: vault, db_path: db,
+        query: "padding", semantic: fullSemantic(model, expansion, rerank),
+      }, session(wrapped))).rejects.toMatchObject({ code: "embeddings_missing" });
+      expect(calls).toEqual([]);
+      await expect(handleRequest({
+        schema_version: 1, action: "search", mode: "full", vault_path: vault, db_path: db,
+        query: "padding", semantic: fullSemantic(model, { ...expansion, sha256: "d".repeat(64) }, rerank),
+      }, session(wrapped))).rejects.toMatchObject({ code: "model_mismatch" });
+      await expect(request("search", { query: "padding", mode: "full", semantic: fullSemantic(model, expansion, rerank) }))
+        .rejects.toMatchObject({ code: "quality_models_missing" });
+      await expect(request("search", { query: "padding", mode: "vector", semantic: fullSemantic(model, expansion, rerank) }))
+        .rejects.toMatchObject({ code: "invalid_request" });
+      expect(idsOf(await request("search", { query: "padding margin", limit: 2 }))).toEqual(lexicalIds);
+    } finally { await real.close(); }
+  });
+
+  test("quality pins and default_mode are explicit and do not change auto", async () => {
+    await request("index");
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
+    const expansion = modelFile("expand.gguf", "GGUF-expansion");
+    const rerank = modelFile("rerank.gguf", "GGUF-rerank");
+    const plain = await openResidentStore(db, source, realpathSync(model.path));
+    expect(plain.internal.llm?.generateModelName).not.toBe(realpathSync(expansion.path));
+    expect(plain.internal.llm?.rerankModelName).not.toBe(realpathSync(rerank.path));
+    await plain.close();
+    const port = await freePort();
+    await expect(startResident(writeConfig(port, writeToken(), model, contractCommand(), { expansion }))).rejects.toMatchObject({ code: "invalid_config" });
+    for (const mode of ["auto", "hybrid", "FULL"]) {
+      await expect(startResident(writeConfig(port, writeToken(), model, contractCommand(), { defaultMode: mode, expansion, rerank })))
+        .rejects.toMatchObject({ code: "invalid_config" });
+    }
+    await expect(startResident(writeConfig(port, writeToken(), model, contractCommand(), { defaultMode: "full", expansion, rerank, unknown: true })))
+      .rejects.toMatchObject({ code: "invalid_config" });
+    const fake = modelFile("rerank-fake.gguf", "not a model");
+    await expect(startResident(writeConfig(port, writeToken(), model, contractCommand(), { expansion, rerank: fake })))
+      .rejects.toMatchObject({ code: "model_invalid" });
+    expect(readFileSync(fake.path, "utf8")).toBe("not a model");
+    const missing = { path: join(vault, "missing-rerank.gguf"), sha256: "e".repeat(64) };
+    await expect(startResident(writeConfig(port, writeToken(), model, contractCommand(), { expansion, rerank: missing })))
+      .rejects.toMatchObject({ code: "model_missing" });
+    const resident = await startResident(writeConfig(port, writeToken(), model, contractCommand(), { defaultMode: "full", expansion, rerank }));
+    residents.push(resident);
+    const healthResponse = await fetch(`http://127.0.0.1:${port}/health`, { headers: { authorization: `Bearer ${token}` } });
+    const health = await healthResponse.json() as Record<string, unknown>;
+    expect(healthResponse.status).toBe(200);
+    expect(health).toEqual({
+      schema_version: 1, status: "ok", vault_path: realpathSync(vault), embed_model_sha256: model.sha256,
+      quality_models: { expansion_model_sha256: expansion.sha256, rerank_model_sha256: rerank.sha256 },
+      engine: { name: "qmd", version: "2.8.3", upstream_commit: UPSTREAM_COMMIT, adapter_revision: "onecard-qmd-v2", mode: "lexical", remote_model_calls: 0 },
+    });
+    const healthText = JSON.stringify(health);
+    expect(healthText).not.toContain(token);
+    expect(healthText).not.toContain("expand.gguf");
+    expect(healthText).not.toContain("resident.token");
+    const lexical = await rpc(port);
+    const automatic = await rpc(port, { mode: "auto" });
+    expect((lexical.engine as { mode: string }).mode).toBe("lexical");
+    expect((automatic.engine as { mode: string }).mode).toBe("lexical");
+    expect(idsOf(lexical)).toEqual(idsOf(await request("search", { query: "padding margin", limit: 2 })));
+    expect(idsOf(automatic)).toEqual(idsOf(lexical));
+    await expect(rpc(port, { mode: "vector", semantic: semantic(model) })).rejects.toMatchObject({ code: "embeddings_missing" });
+    await expect(rpc(port, { mode: "full", semantic: semantic(model) })).rejects.toMatchObject({ code: "quality_models_missing" });
+    await expect(rpc(port, { mode: "full", semantic: fullSemantic(model, expansion, { ...rerank, sha256: "f".repeat(64) }) }))
+      .rejects.toMatchObject({ code: "model_mismatch" });
+    await expect(rpc(port, { mode: "full", semantic: fullSemantic(model, expansion, rerank) })).rejects.toMatchObject({ code: "embeddings_missing" });
+    expect(resident.storesOpened()).toBe(1);
+    expect(idsOf(await rpc(port))).toEqual(idsOf(lexical));
   });
 
   test("resident auth, origin, vault, health, and warm store reuse", async () => {
