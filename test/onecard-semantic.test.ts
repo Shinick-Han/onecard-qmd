@@ -654,4 +654,182 @@ describe("One Card semantic contract", () => {
     expect(output).not.toContain(token);
     expect(output).not.toContain("padding margin");
   });
+
+  test("resident status inventories current documents without inference", async () => {
+    const absent = "33333333-3333-4333-8333-333333333333";
+    const mismatch = "44444444-4444-4444-8444-444444444444";
+    const oversize = "55555555-5555-4555-8555-555555555555";
+    const broken = "77777777-7777-4777-8777-777777777777";
+    const grown = "88888888-8888-4888-8888-888888888888";
+    note(mismatch, "foreign permalink body");
+    const mismatchPath = join(source, mismatch + ".md");
+    writeFileSync(mismatchPath, readFileSync(mismatchPath, "utf8").replace(`knowledge/${mismatch}`, `knowledge/${one}`));
+    writeFileSync(join(source, broken + ".md"),
+      `---\nqmd: {metadata: {permalink: "knowledge/${broken}", card_version: "nope", source_version: "${version}"}}\n---\n\n# broken meta\n`);
+    note(grown, "small atom");
+    await request("index");
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
+    const verified = realpathSync(model.path);
+    const stdinStatus = await request("status");
+    expect(Object.keys(stdinStatus).sort()).toEqual(["action", "engine", "latency_ms", "residency", "schema_version", "status"]);
+    expect((await request("search", { query: "padding", allowed_ids: [] })).results).toEqual([]);
+    await expect(request("status", { include_documents: true, allowed_ids: [one] })).rejects.toMatchObject({ code: "semantic_unconfigured" });
+    await expect(handleRequest({
+      schema_version: 1, action: "status", vault_path: vault, db_path: db,
+      include_documents: true, allowed_ids: [one],
+    }, { modelPath: verified, modelSha256: model.sha256, residency: "cold" })).rejects.toMatchObject({ code: "semantic_unconfigured" });
+    await expect(request("search", { query: "padding", include_documents: true, allowed_ids: [one] })).rejects.toMatchObject({ code: "invalid_request" });
+    const real = await openResidentStore(db, source, verified);
+    const calls: string[] = [];
+    const bodyGets: string[] = [];
+    const session = (store: QMDStore): StoreSession => ({ store, modelPath: verified, modelSha256: model.sha256, residency: "warm" });
+    const quiet = (store: QMDStore): QMDStore => ({
+      ...store,
+      close: async () => { calls.push("close"); },
+      embed: async () => { calls.push("embed"); throw new Error("embed"); },
+      update: async () => { calls.push("update"); throw new Error("update"); },
+      search: async () => { calls.push("search"); throw new Error("search"); },
+      searchLex: async () => { calls.push("searchLex"); throw new Error("searchLex"); },
+      searchVector: async () => { calls.push("searchVector"); throw new Error("searchVector"); },
+      expandQuery: async () => { calls.push("expandQuery"); throw new Error("expand"); },
+    });
+    const tracking: QMDStore = {
+      ...quiet(real),
+      get: async (path, options) => {
+        const virtual = String(path);
+        if (options?.includeBody) bodyGets.push(virtual);
+        if (virtual.includes(oversize)) {
+          if (options?.includeBody) throw new Error("oversize body loaded");
+          return {
+            filepath: `qmd://${COLLECTION}/${oversize}.md`,
+            displayPath: `${COLLECTION}/${oversize}.md`,
+            title: "hidden oversize title",
+            context: null,
+            hash: "e".repeat(64),
+            docid: "eeeeee",
+            collectionName: COLLECTION,
+            modifiedAt: "2020-01-01",
+            bodyLength: 1024 * 1024 + 1,
+          };
+        }
+        return real.get(path, options);
+      },
+    };
+    type Row = { id: string; sha256: string; indexed_hash: string; indexed_card_version: string; indexed_source_version: string };
+    const inventoryRequest = (store: QMDStore, allowedIds: string[]) => handleRequest({
+      schema_version: 1, action: "status", vault_path: vault, db_path: db,
+      include_documents: true, allowed_ids: allowedIds,
+    }, session(store));
+    try {
+      const plain = await handleRequest({ schema_version: 1, action: "status", vault_path: vault, db_path: db }, session(quiet(real)));
+      expect(Object.keys(plain).sort()).toEqual(["action", "engine", "latency_ms", "residency", "schema_version", "status"]);
+      expect(plain.status).toEqual(stdinStatus.status);
+      expect(plain.status).toEqual(await real.getIndexHealth());
+      await expect(handleRequest({
+        schema_version: 1, action: "status", vault_path: vault, db_path: db,
+        include_documents: true, allowed_ids: [one],
+      }, { store: real, modelPath: verified, modelSha256: "", residency: "warm" })).rejects.toMatchObject({ code: "semantic_unconfigured" });
+      await expect(handleRequest({
+        schema_version: 1, action: "status", vault_path: vault, db_path: db,
+        include_documents: "yes", allowed_ids: [one],
+      }, session(real))).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(handleRequest({
+        schema_version: 1, action: "status", vault_path: vault, db_path: db,
+        include_documents: true, allowed_ids: [one], semantic: semantic(model),
+      }, session(real))).rejects.toMatchObject({ code: "invalid_request" });
+
+      const repeated = Array.from({ length: 256 }, () => one);
+      await expect(inventoryRequest(real, [...repeated, one])).rejects.toMatchObject({ code: "invalid_ids" });
+      await expect(inventoryRequest(real, [])).rejects.toMatchObject({ code: "invalid_ids" });
+      await expect(handleRequest({
+        schema_version: 1, action: "status", vault_path: vault, db_path: db, include_documents: true,
+      }, session(real))).rejects.toMatchObject({ code: "invalid_ids" });
+      await expect(inventoryRequest(real, ["../other"])).rejects.toMatchObject({ code: "invalid_ids" });
+
+      const deduped = await inventoryRequest(tracking, repeated);
+      expect((deduped.documents as Row[]).map(row => row.id)).toEqual([one]);
+      expect(deduped.missing_ids).toEqual([]);
+
+      writeFileSync(join(source, grown + ".md"), "x".repeat(1024 * 1024 + 1));
+      const beforeTwo = readFileSync(join(source, two + ".md"), "utf8").replace(/\r\n/g, "\n");
+      const listed = await inventoryRequest(tracking, [one, absent, one, mismatch, broken, grown, oversize, two]);
+      const documents = listed.documents as Row[];
+      expect(documents.map(row => row.id)).toEqual([one, two]);
+      expect(listed.missing_ids).toEqual([absent, mismatch, broken, grown, oversize]);
+      expect(listed.embed_model_sha256).toBe(model.sha256);
+      expect(listed.vectors_ready).toBe(false);
+      expect(listed.residency).toBe("warm");
+      expect((listed.engine as { mode: string; remote_model_calls: number }).mode).toBe("lexical");
+      expect((listed.engine as { remote_model_calls: number }).remote_model_calls).toBe(0);
+      expect(listed.status).toEqual(plain.status);
+      const fresh = documents[0];
+      if (!fresh) throw new Error("Missing indexed document");
+      const currentOne = readFileSync(join(source, one + ".md"), "utf8").replace(/\r\n/g, "\n");
+      expect(Object.keys(fresh).sort()).toEqual(["id", "indexed_card_version", "indexed_hash", "indexed_source_version", "sha256"]);
+      expect(fresh.sha256).toBe(createHash("sha256").update(currentOne).digest("hex"));
+      expect(fresh.indexed_card_version).toBe(card);
+      expect(fresh.indexed_source_version).toBe(version);
+      const indexed = documents[1];
+      if (!indexed) throw new Error("Missing second document");
+      expect(indexed.sha256).toBe(createHash("sha256").update(beforeTwo).digest("hex"));
+      expect(indexed.indexed_card_version).toBe(card);
+      expect(bodyGets.some(path => path.includes(oversize) || path.includes(absent) || path.includes(grown))).toBe(false);
+      const encoded = JSON.stringify(listed);
+      for (const secret of ["padding", "foreign permalink", "broken meta", "hidden oversize", "nope", vault, "AgentNotes", model.path])
+        expect(encoded).not.toContain(secret);
+
+      const staleCard = "c".repeat(64);
+      writeFileSync(join(source, two + ".md"), beforeTwo.replace(card, staleCard).replace("layout examples", "replaced examples"));
+      const stale = await inventoryRequest(tracking, [two]);
+      const staleRow = (stale.documents as Row[])[0];
+      const staleFile = readFileSync(join(source, two + ".md"), "utf8").replace(/\r\n/g, "\n");
+      expect(staleRow?.indexed_hash).toBe(indexed.indexed_hash);
+      expect(staleRow?.indexed_card_version).toBe(card);
+      expect(staleRow?.indexed_source_version).toBe(version);
+      expect(staleRow?.indexed_card_version).not.toBe(staleCard);
+      expect(staleRow?.sha256).toBe(createHash("sha256").update(staleFile).digest("hex"));
+      expect(staleRow?.sha256).not.toBe(indexed.sha256);
+      expect(staleRow?.sha256).not.toBe(staleRow?.indexed_hash);
+      expect(JSON.stringify(stale)).not.toContain("replaced examples");
+
+      const health = async (status: { totalDocuments: number; needsEmbedding: number; hasVectorIndex: boolean }) => {
+        const wrapped: QMDStore = {
+          ...quiet(real),
+          getStatus: async () => ({ ...status, pendingMetadata: 0, collections: [] }),
+        };
+        const response = await inventoryRequest(wrapped, [one]);
+        return response.vectors_ready;
+      };
+      expect(await health({ totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true })).toBe(false);
+      expect(await health({ totalDocuments: 2, needsEmbedding: 1, hasVectorIndex: true })).toBe(false);
+      expect(await health({ totalDocuments: 2, needsEmbedding: 0, hasVectorIndex: false })).toBe(false);
+      expect(await health({ totalDocuments: 2, needsEmbedding: 0, hasVectorIndex: true })).toBe(true);
+      for (const name of ["embed", "update", "search", "searchLex", "searchVector", "expandQuery", "close"])
+        expect(calls).not.toContain(name);
+    } finally { await real.close(); }
+  });
+
+  test("loopback status inventory uses the resident pin", async () => {
+    await request("index");
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
+    const absent = "33333333-3333-4333-8333-333333333333";
+    const { port } = await boot(model);
+    const body = await callResident(`http://127.0.0.1:${port}`, token, {
+      schema_version: 1, action: "status", vault_path: vault, db_path: db,
+      include_documents: true, allowed_ids: [one, absent],
+    });
+    const row = (body.documents as { id: string; sha256: string; indexed_hash: string }[])[0];
+    const current = readFileSync(join(source, one + ".md"), "utf8").replace(/\r\n/g, "\n");
+    expect(body.embed_model_sha256).toBe(model.sha256);
+    expect(body.vectors_ready).toBe(false);
+    expect(row?.id).toBe(one);
+    expect(row?.sha256).toBe(createHash("sha256").update(current).digest("hex"));
+    expect(body.missing_ids).toEqual([absent]);
+    expect(JSON.stringify(body)).not.toContain(vault);
+    expect(JSON.stringify(body)).not.toContain("padding");
+    const plain = await callResident(`http://127.0.0.1:${port}`, token, {
+      schema_version: 1, action: "status", vault_path: vault, db_path: db,
+    });
+    expect(Object.keys(plain).sort()).toEqual(["action", "engine", "latency_ms", "residency", "schema_version", "status"]);
+  });
 });

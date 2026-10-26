@@ -104,6 +104,8 @@ Missing pieces are errors, not empty success:
 | Index has documents without current vectors | `embeddings_missing` |
 | Index database absent | `index_missing` |
 | Resident process is down | `server_unavailable` |
+| `status` `include_documents` outside the resident pin | `semantic_unconfigured` |
+| Document inventory IDs missing, empty, or over 256 | `invalid_ids` |
 
 ## Resident server
 
@@ -116,6 +118,19 @@ port. The parent owns the process lifetime and any Windows token ACL.
 - Requests that carry an `Origin` header, the wrong or missing token, another
   path, a body over 1 MiB, or a different vault are rejected.
 - HTTP allows only `search` and `status`. `index` and `embed` stay stdin actions.
+- `status` with `include_documents: true` is resident-only and requires `allowed_ids`
+  of 1 to 256 current UUIDs, deduplicated. It adds `embed_model_sha256`,
+  `vectors_ready`, `documents`, and `missing_ids` beside the existing `status`.
+  `vectors_ready` is true only when `getStatus` reports documents, zero
+  `needsEmbedding` for the pinned embed model, and `hasVectorIndex`. An empty
+  index is not ready. Each document row is `{id, sha256, indexed_hash,
+  indexed_card_version, indexed_source_version}`. `sha256` is the current
+  LF-normalized vault file. `indexed_hash` and the indexed versions come from
+  `store.get(qmd://one-card-atoms/ID.md, {includeBody:true})` and
+  `extractDocumentMetadata` on that stored body. A stale file keeps the indexed
+  values. Missing, oversized (above 1 MiB), or identity-mismatched IDs are
+  listed in `missing_ids` with no title, body, or path. This call does not
+  search, embed, download, or start anything. Plain `status` omits these fields.
 - The process keeps one SDK store and runs requests one at a time. A vector-only
   config opens it with `models.embed`. When both quality pins exist, startup
   verifies all three SHA-256 digests and GGUF headers, then opens the store with
