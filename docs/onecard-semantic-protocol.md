@@ -24,14 +24,15 @@ Unreviewed documents are not dropped.
 ## Runtime config
 
 `schema_version`, `upstream_commit`, and `command` are required. `command` is
-validated and not executed. Semantic config is optional for stdin lexical use
-and required for `--serve`:
+the parent argv `[bunExecutable, dist/onecard/cli.js]`: exactly two absolute
+paths to existing files. The server keeps that array and does not execute it.
+Semantic config is optional for stdin lexical use and required for `--serve`:
 
 ```json
 {
   "schema_version": 1,
   "upstream_commit": "86d2365d17fc682e491c2c53d1e4a884aee8682a",
-  "command": "onecard-qmd",
+  "command": ["/absolute/bun", "/absolute/dist/onecard/cli.js"],
   "semantic": {
     "enabled": true,
     "vault_path": "/absolute/vault",
@@ -41,7 +42,7 @@ and required for `--serve`:
 }
 ```
 
-The model path, token file, config file, and vault must be absolute local paths.
+The two command files, model path, token file, config file, and vault must be absolute local paths.
 Archive markers and symlink path components are rejected. The model file must
 already exist, match the pinned SHA-256, and start with a GGUF header. This
 adapter does not download models and does not change token permissions.

@@ -9,6 +9,8 @@ import {
 } from "./bridge.js";
 
 type RuntimeConfig = {
+  /** Parent argv, retained and never spawned. */
+  command: readonly [string, string];
   vaultPath: string;
   model: { path: string; sha256: string };
   tokenFile: string;
@@ -43,8 +45,7 @@ function loadConfig(configPath: string): RuntimeConfig {
     fail("invalid_config", "Runtime config shape is not valid.");
   if (record.schema_version !== 1) fail("invalid_config", "Runtime config schema is not supported.");
   if (record.upstream_commit !== UPSTREAM_COMMIT) fail("upstream_mismatch", "Runtime config does not match the pinned upstream commit.");
-  if (typeof record.command !== "string" || record.command.length < 1 || record.command.length > 4096)
-    fail("invalid_config", "Runtime config command is invalid.");
+  const command = loadCommand(record.command);
   const semantic = record.semantic;
   if (!semantic || typeof semantic !== "object" || Array.isArray(semantic)) fail("invalid_config", "Semantic config shape is not valid.");
   const semanticRecord = semantic as Record<string, unknown>;
@@ -65,12 +66,29 @@ function loadConfig(configPath: string): RuntimeConfig {
   if (!match || port > 65_535) fail("invalid_config", "Resident URL must be http://127.0.0.1:PORT.");
   if (typeof semanticRecord.vault_path !== "string") fail("invalid_config", "Semantic config shape is not valid.");
   return {
+    command,
     vaultPath: semanticRecord.vault_path,
     model: { path: modelRecord.path, sha256: modelRecord.sha256 },
     tokenFile: residentRecord.token_file,
     url: residentRecord.url,
     port,
   };
+}
+
+function loadCommand(value: unknown): [string, string] {
+  if (!Array.isArray(value) || value.length !== 2)
+    fail("invalid_config", "Runtime config command must be two absolute files.");
+  const retained: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string" || !isAbsolute(item))
+      fail("invalid_config", "Runtime config command must be two absolute files.");
+    resolveGuardedFile(item, "invalid_config");
+    retained.push(item);
+  }
+  const executable = retained[0];
+  const entry = retained[1];
+  if (!executable || !entry) fail("invalid_config", "Runtime config command must be two absolute files.");
+  return [executable, entry];
 }
 
 function readToken(tokenFile: string): string {
@@ -161,7 +179,7 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 export async function startResident(configPath: string): Promise<Resident> {
   const config = loadConfig(configPath);
-  // `command` is retained by configuration validation and is never executed here.
+  // Parent setup owns this argv. The array is retained and never passed to a process.
   const pinned = await verifyEmbedModel(config.model);
   const vault = canonicalVault(config.vaultPath);
   readToken(config.tokenFile);

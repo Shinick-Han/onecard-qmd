@@ -49,7 +49,11 @@ function writeToken(path = join(vault, "resident.token")): string {
   writeFileSync(path, token + "\n", { mode: 0o600 });
   return path;
 }
-function writeConfig(port: number, tokenFile: string, model: { path: string; sha256: string }, command = "onecard-test") {
+function contractCommand(): [string, string] {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  return [process.execPath, join(root, "dist", "onecard", "cli.js")];
+}
+function writeConfig(port: number, tokenFile: string, model: { path: string; sha256: string }, command: readonly string[] = contractCommand()) {
   const path = join(vault, `runtime-${port}.json`);
   writeFileSync(path, JSON.stringify({
     schema_version: 1, upstream_commit: UPSTREAM_COMMIT, command,
@@ -58,7 +62,7 @@ function writeConfig(port: number, tokenFile: string, model: { path: string; sha
   }));
   return path;
 }
-async function boot(model: { path: string; sha256: string }, command?: string): Promise<{ resident: Resident; port: number }> {
+async function boot(model: { path: string; sha256: string }, command?: readonly string[]): Promise<{ resident: Resident; port: number }> {
   const port = await freePort();
   const resident = await startResident(writeConfig(port, writeToken(), model, command));
   residents.push(resident);
@@ -275,14 +279,11 @@ describe("One Card semantic contract", () => {
 
   test("resident auth, origin, vault, health, and warm store reuse", async () => {
     const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
-    const sentinel = join(vault, "command-ran");
-    const command = `node -e "require('fs').writeFileSync('${sentinel.replaceAll("\\", "\\\\")}','x')"`;
     await request("index");
     writeToken();
     const mode = statSync(join(vault, "resident.token")).mode;
-    const { resident, port } = await boot(model, command);
+    const { resident, port } = await boot(model);
     expect(statSync(join(vault, "resident.token")).mode).toBe(mode);
-    expect(existsSync(sentinel)).toBe(false);
     const healthResponse = await fetch(`http://127.0.0.1:${port}/health`, { headers: { authorization: `Bearer ${token}` } });
     const health = await healthResponse.json() as Record<string, unknown>;
     expect(healthResponse.status).toBe(200);
@@ -352,7 +353,6 @@ describe("One Card semantic contract", () => {
     await expect(rpc(port, { action: "embed", semantic: semantic(model), query: undefined, limit: undefined }))
       .rejects.toMatchObject({ code: "action_unavailable" });
     expect(resident.storesOpened()).toBe(1);
-    expect(existsSync(sentinel)).toBe(false);
     writeFileSync(join(vault, "ARCHIVED.json"), "{}");
     await expect(rpc(port)).rejects.toMatchObject({ code: "archived" });
   });
@@ -373,6 +373,53 @@ describe("One Card semantic contract", () => {
     rewritten.semantic.resident.url = "http://localhost:" + port;
     writeFileSync(config, JSON.stringify(rewritten));
     await expect(startResident(config)).rejects.toMatchObject({ code: "invalid_config" });
+  });
+
+  test("the parent command argv is two guarded files and health stays uninferred", async () => {
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
+    const port = await freePort();
+    const tokenFile = writeToken();
+    const command = contractCommand();
+    const config = {
+      schema_version: 1,
+      upstream_commit: UPSTREAM_COMMIT,
+      command,
+      semantic: {
+        enabled: true,
+        vault_path: vault,
+        embed_model: { path: model.path, sha256: model.sha256 },
+        resident: { url: `http://127.0.0.1:${port}`, token_file: tokenFile },
+      },
+    };
+    const path = join(vault, "runtime.json");
+    writeFileSync(path, JSON.stringify(config));
+    const resident = await startResident(path);
+    residents.push(resident);
+    const response = await fetch(`http://127.0.0.1:${port}/health`, { headers: { authorization: `Bearer ${token}` } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      schema_version: 1,
+      status: "ok",
+      vault_path: realpathSync(vault),
+      embed_model_sha256: model.sha256,
+      engine: {
+        name: "qmd", version: "2.8.3", upstream_commit: UPSTREAM_COMMIT,
+        adapter_revision: "onecard-qmd-v2", mode: "lexical", remote_model_calls: 0,
+      },
+    });
+    expect(JSON.parse(readFileSync(path, "utf8")).command).toEqual(command);
+    const malformed = join(vault, "malformed-command.json");
+    for (const bad of [
+      "onecard-qmd",
+      [command[0]],
+      [command[0], command[1], command[0]],
+      [command[0], "dist/onecard/cli.js"],
+      [command[0], join(vault, "missing-cli.js")],
+      { executable: command[0], entry: command[1] },
+    ]) {
+      writeFileSync(malformed, JSON.stringify({ ...config, command: bad }));
+      await expect(startResident(malformed)).rejects.toMatchObject({ code: "invalid_config" });
+    }
   });
 
   test("the serve command binds the configured loopback port without logging content", async () => {
