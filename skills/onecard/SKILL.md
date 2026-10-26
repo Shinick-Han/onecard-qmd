@@ -59,7 +59,12 @@ invent evidence when the indexed corpus still lacks support.
 
 ## Retrieve and judge the source
 
-Rank and QMD scores locate documents; they are not confidence or applicability.
+Rank and QMD scores locate documents; they are not confidence, truth, or approval.
+The consume result adds agent instructions, not a semantic verifier. `evidence.state`
+is `candidates`, `deferred`, or `none`; `proof` is false; `score_is_confidence` is
+false; `read_originals` is true. Each `match.applicability` arrives `unassessed`.
+No model or score threshold sits behind those fields. Do not rerank or drop
+candidates with a cutoff of your own, and do not add a model call to judge them.
 Never answer from snippets alone. Read selected English notes before applying:
 
     knowledge read DOCUMENT_UUID --view body --offset 0 --limit 2400
@@ -88,6 +93,12 @@ Section labels describe provenance and cannot independently verify a statement.
 Distinguish source statements, prior agent interpretations and your proposed
 application. Several cards from one source are one evidence lineage. Expose
 conflicts; check current code or official documentation for version-sensitive use.
+
+After reading, judge the selected sources against the full user intent as
+`supports`, `partial`, `irrelevant`, or `contradicts`. `none` has no candidates.
+`deferred` is omitted by budget, not disproof or support. If no source you read
+supports the request, abstain with `insufficient evidence` and explain that in
+the user's language. Do not put every answer in a fixed evidence form.
 
 ## Apply only to the authorized task
 
