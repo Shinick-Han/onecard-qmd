@@ -4,11 +4,14 @@ import { createReadStream, existsSync, lstatSync, mkdirSync, openSync, closeSync
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { createStore, type HybridQueryResult, type MetadataFilter, type QMDStore, type SearchResult } from "../index.js";
+import { extractDocumentMetadata } from "../metadata.js";
 import { METADATA_FILTER_LIMITS } from "../metadata-filter.js";
 
 export const UPSTREAM_COMMIT = "86d2365d17fc682e491c2c53d1e4a884aee8682a";
 export const COLLECTION = "one-card-atoms";
 export const MAX_REQUEST_BYTES = 1024 * 1024;
+const DOCUMENT_INVENTORY_LIMIT = 256;
+const ATOM_BODY_BYTES = MAX_REQUEST_BYTES;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const GGUF = Buffer.from("GGUF");
@@ -292,6 +295,44 @@ async function materialize(store: QMDStore, hit: Hit, vault: string, source: str
   return row;
 }
 
+function currentFileSha256(vault: string, source: string, id: string): string | undefined {
+  const file = join(source, id + ".md");
+  guardInside(vault, file);
+  if (!existsSync(file)) return undefined;
+  const info = statSync(file);
+  if (!info.isFile() || info.size > ATOM_BODY_BYTES) return undefined;
+  const text = readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+  if (Buffer.byteLength(text) > ATOM_BODY_BYTES) return undefined;
+  return createHash("sha256").update(text).digest("hex");
+}
+
+async function inventoryDocument(store: QMDStore, vault: string, source: string, id: string): Promise<Record<string, string> | undefined> {
+  const virtual = `qmd://${COLLECTION}/${id}.md`;
+  const preview = await store.get(virtual);
+  if (!preview || typeof preview !== "object" || "error" in preview) return undefined;
+  if (preview.collectionName !== COLLECTION || basename(preview.displayPath) !== id + ".md") return undefined;
+  if (preview.bodyLength > ATOM_BODY_BYTES) return undefined;
+  const sha256 = currentFileSha256(vault, source, id);
+  if (!sha256) return undefined;
+  const indexed = await store.get(virtual, { includeBody: true });
+  if (!indexed || typeof indexed !== "object" || "error" in indexed || typeof indexed.body !== "string") return undefined;
+  if (indexed.collectionName !== COLLECTION || basename(indexed.displayPath) !== id + ".md" || indexed.hash !== preview.hash) return undefined;
+  if (Buffer.byteLength(indexed.body) > ATOM_BODY_BYTES) return undefined;
+  const extracted = extractDocumentMetadata(indexed.body, id + ".md");
+  if (extracted.error) return undefined;
+  const card = extracted.metadata.card_version;
+  const version = extracted.metadata.source_version;
+  if (extracted.metadata.permalink !== `knowledge/${id}`) return undefined;
+  if (typeof card !== "string" || typeof version !== "string" || !HASH.test(card) || !HASH.test(version)) return undefined;
+  return {
+    id,
+    sha256,
+    indexed_hash: indexed.hash,
+    indexed_card_version: card,
+    indexed_source_version: version,
+  };
+}
+
 export async function openResidentStore(
   db: string,
   source: string,
@@ -322,6 +363,11 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
   if (request.schema_version !== 1 || !["index", "search", "status", "embed"].includes(String(request.action)))
     fail("invalid_request", "Unknown protocol or action.");
   const action = String(request.action);
+  const includeDocuments = request.include_documents === true;
+  if (request.include_documents !== undefined && typeof request.include_documents !== "boolean")
+    fail("invalid_request", "include_documents must be boolean.");
+  if (includeDocuments && action !== "status")
+    fail("invalid_request", "Document inventory is a status option.");
   const mode = resolveMode(action, request.mode);
   if ((action === "index" || action === "status") && mode !== "lexical")
     fail("mode_unavailable", "Index and status stay lexical.");
@@ -333,8 +379,12 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
   if (!samePath(db, join(vault, ".knowledge", "qmd", "index.sqlite"))) fail("invalid_db", "Use the dedicated vault QMD index.");
   guardInside(vault, db);
   let allowed: string[] | undefined;
+  if (includeDocuments && request.allowed_ids === undefined)
+    fail("invalid_ids", "Document inventory requires current document IDs.");
   if (request.allowed_ids !== undefined) {
-    if (!Array.isArray(request.allowed_ids) || request.allowed_ids.length > 5000) fail("invalid_ids", "Invalid current document IDs.");
+    const idLimit = includeDocuments ? DOCUMENT_INVENTORY_LIMIT : 5000;
+    if (!Array.isArray(request.allowed_ids) || request.allowed_ids.length > idLimit || (includeDocuments && request.allowed_ids.length === 0))
+      fail("invalid_ids", "Invalid current document IDs.");
     const ids: string[] = [];
     for (const id of request.allowed_ids) {
       if (typeof id !== "string" || !UUID.test(id)) fail("invalid_ids", "Invalid current document IDs.");
@@ -402,7 +452,29 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
     const collection = (await store.listCollections()).find(item => item.name === COLLECTION);
     if (!collection || !samePath(realpathSync(collection.pwd), realpathSync(source)))
       fail("index_identity", "QMD index belongs to a different collection.");
-    if (action === "status") return finish(action, "lexical", { status: await store.getIndexHealth() }, residency, started);
+    if (action === "status") {
+      if (includeDocuments && (!session?.store || !session.modelSha256))
+        fail("semantic_unconfigured", "Document inventory requires the resident pinned embed model.");
+      const status = await store.getIndexHealth();
+      if (!includeDocuments) return finish(action, "lexical", { status }, residency, started);
+      if (!session?.store || !session.modelSha256)
+        fail("semantic_unconfigured", "Document inventory requires the resident pinned embed model.");
+      const modelHealth = await store.getStatus();
+      const documents = [];
+      const missingIds = [];
+      for (const id of allowed ?? []) {
+        const row = await inventoryDocument(store, vault, source, id);
+        if (row) documents.push(row);
+        else missingIds.push(id);
+      }
+      return finish(action, "lexical", {
+        status,
+        embed_model_sha256: session.modelSha256,
+        vectors_ready: modelHealth.totalDocuments > 0 && modelHealth.needsEmbedding === 0 && modelHealth.hasVectorIndex,
+        documents,
+        missing_ids: missingIds,
+      }, residency, started);
+    }
     if (action === "embed") {
       if (!pin) fail("semantic_unconfigured", "Explicit semantic operations require a local embedding model pin.");
       const embedded = await store.embed({ model: pin.path, collection: COLLECTION });
