@@ -17,16 +17,27 @@ it does not train the model or authorize unrelated changes.
 
 ## Find candidates using upstream retrieval
 
-First turn the user's request into short, source-like search terms. For English
-agent notes, use precise English anchors even if the user asks in Korean. Do not
-paste a long conversational question and expect lexical search to infer intent.
-The agent chooses terms; the adapter never translates, rewrites, adds aliases or
-re-ranks them. QMD owns parsing, indexing, BM25 ranking and result order.
-Keep the user's full intent in `intent`; search with 2-4 discriminating English
-anchors. Preserve product names and constraints instead of translating them into
-broader topics. For example, code reuse uses `reuse existing`, crowded card
-spacing uses `padding margin`, and verification of spurious findings uses
-`false positives`. These illustrate agent choices, not a runtime synonym map.
+Keep the user's full intent in `intent`. Search with a short query that preserves
+precise identifiers, product names, and constraints. Do not replace those with a
+broader topic, and do not keep a private synonym map. `reuse existing`,
+`padding margin`, and `false positives` show that choice, not a runtime alias list.
+
+Name the mode when the task needs a specific pipeline. If the call does not name
+one, the integration applies runtime `default_mode` (`lexical`, `vector`, `rrf`,
+or `full`) before the native request. Native `auto` stays lexical and is not that
+default. `hybrid` is not a mode. `default_mode` is an optional top-level runtime
+field. Semantic config may add only `expansion_model` and `rerank_model`, and
+only as a pair. Maintenance settings belong in `qmd-maintenance.json`, not in
+semantic keys.
+
+- `lexical`: BM25 of the query as written. No expansion or rerank.
+- `vector`: SDK vector search of that same query. No expansion or rerank.
+- `rrf`: lex plus vector fusion of that same query with rerank off. This is not full retrieval.
+- `full`: upstream `store.search` with the original query and rerank on, which expands and reranks. Both quality pins are required. Missing pins return `quality_models_missing` and do not fall back.
+
+A query does not embed the corpus, download a model, or start the resident.
+Index and embed stay explicit. Do not install models, reindex, sync sources, or
+change global settings during knowledge consumption.
 
 Use knowledge_consume MCP with limit 2 and budget_chars 3500. Its current contract
 is integration_revision = one-card-consume-v2,
@@ -40,12 +51,6 @@ If PATH lacks the command, resolve knowledge.cmd under the user's .local/bin.
 An exact document UUID can be read directly without searching.
 Updated MCP servers use a fresh worker per read/consume call. A server predating
 this launcher needs one client reconnect; do not kill unrelated agent processes.
-
-Follow QMD's mode guidance: lexical search is useful for exact anchors; structured
-semantic retrieval is useful for indirect descriptions when its local models are
-explicitly prepared. This integration currently uses QMD lexical mode, with no
-model inference or downloads. Do not label it hybrid. Do not install models,
-reindex, sync sources, or change global settings during knowledge consumption.
 
 If a query returns nothing, use one focused reformulation with fewer reliable
 anchors, as QMD recommends. For example, try `editable native` after an overly

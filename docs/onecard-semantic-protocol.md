@@ -52,7 +52,9 @@ lexical use and required for `--serve`:
 `expansion_model` and `rerank_model` are optional and must appear together.
 Each pin is `{ "path": absolute local file, "sha256": 64 lowercase hex }`.
 Unknown keys are `invalid_config`. A vector-only config, with no quality pins
-and no `default_mode`, remains valid.
+and no `default_mode`, remains valid. Maintenance settings are not semantic
+keys; they belong in a separate `qmd-maintenance.json`, which this resident
+does not read.
 
 The two command files, model paths, token file, config file, and vault must be absolute local paths.
 Archive markers and symlink path components are rejected. The model file must
