@@ -33,7 +33,7 @@ semantic keys.
 - `lexical`: BM25 of the query as written. No expansion or rerank.
 - `vector`: SDK vector search of that same query. No expansion or rerank.
 - `rrf`: lex plus vector fusion of that same query with rerank off. This is not full retrieval.
-- `full`: upstream `store.search` with the original query and rerank on, which expands and reranks. Both quality pins are required. Missing pins return `quality_models_missing` and do not fall back.
+- `full`: upstream `store.search` with the original query and rerank on. Expansion is conditional: a strong BM25 hit can skip it, so the query is not guaranteed to have been rewritten. Both quality pins are required. Missing pins return `quality_models_missing` and do not fall back.
 
 A query does not embed the corpus, download a model, or start the resident.
 Index and embed stay explicit. Do not install models, reindex, sync sources, or
