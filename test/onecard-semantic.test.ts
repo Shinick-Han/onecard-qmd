@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, statSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, lstatSync, statSync, existsSync, realpathSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -76,6 +76,32 @@ function idsOf(body: Record<string, unknown>) {
   return (body.results as { docid: string; score: number }[]).map(hit => [hit.docid, hit.score]);
 }
 
+const SYMLINK_UNAVAILABLE = new Set(["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"]);
+
+/** Probe once. File links cannot fall back to a junction; a directory junction counts only when lstat still reports a symlink. */
+function symlinkAvailable(kind: "file" | "dir" | "junction"): boolean {
+  if (kind === "junction" && process.platform !== "win32") return false;
+  const root = mkdtempSync(join(tmpdir(), "onecard-symlink-cap-"));
+  try {
+    const target = join(root, "target");
+    const link = join(root, "link");
+    if (kind === "file") writeFileSync(target, "probe");
+    else mkdirSync(target);
+    try { symlinkSync(target, link, kind); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code && SYMLINK_UNAVAILABLE.has(code)) return false;
+      throw error;
+    }
+    return kind !== "junction" || lstatSync(link).isSymbolicLink();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const fileSymlinks = symlinkAvailable("file");
+const vaultLinkKind = symlinkAvailable("dir") ? "dir" as const : symlinkAvailable("junction") ? "junction" as const : undefined;
+
 beforeEach(() => {
   vault = mkdtempSync(join(tmpdir(), "onecard-semantic-"));
   source = join(vault, "AgentNotes", "Atoms");
@@ -133,29 +159,50 @@ describe("One Card semantic contract", () => {
     expect(idsOf(await request("search", { query: "padding", limit: 2 }))).toEqual(idsOf(lexical));
   });
 
-  test("archive, symlink, and vault boundaries reject model, token, and vault paths", async () => {
+  test("archived models, foreign vaults, and current document ids are refused", async () => {
     const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
     const boxed = join(vault, "boxed");
     mkdirSync(boxed);
     writeFileSync(join(boxed, "ARCHIVED.json"), "{}");
     const archived = modelFile("boxed/model.gguf", "GGUF-archived");
     await expect(request("search", { query: "padding", mode: "vector", semantic: semantic(archived) })).rejects.toMatchObject({ code: "archived" });
+    const other = mkdtempSync(join(tmpdir(), "onecard-other-vault-"));
+    try {
+      mkdirSync(join(other, "AgentNotes", "Atoms"), { recursive: true });
+      await expect(handleRequest({ schema_version: 1, action: "search", vault_path: other, db_path: db, query: "padding" }))
+        .rejects.toMatchObject({ code: "invalid_db" });
+    } finally {
+      if (!other.startsWith(join(tmpdir(), "onecard-other-vault-"))) throw new Error("Unexpected test vault");
+      rmSync(other, { recursive: true, force: true });
+    }
+    await expect(request("search", { query: "padding", mode: "vector", allowed_ids: ["../other"], semantic: semantic(model) }))
+      .rejects.toMatchObject({ code: "invalid_ids" });
+  });
+
+  test.skipIf(!fileSymlinks)("a model file symlink is refused", async () => {
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
     const link = join(vault, "model-link.gguf");
-    symlinkSync(model.path, link);
+    symlinkSync(model.path, link, "file");
     await expect(request("search", { query: "padding", mode: "vector", semantic: semantic({ path: link, sha256: model.sha256 }) }))
       .rejects.toMatchObject({ code: "path_escape" });
+  });
+
+  test.skipIf(vaultLinkKind === undefined)("a vault directory link is refused", async () => {
+    if (!vaultLinkKind) throw new Error("Directory link capability is unavailable.");
     const vaultLink = join(tmpdir(), "onecard-vault-link-" + vault.slice(-6));
-    symlinkSync(vault, vaultLink);
+    symlinkSync(vault, vaultLink, vaultLinkKind);
     try {
       await expect(handleRequest({ schema_version: 1, action: "search", vault_path: vaultLink, db_path: db, query: "padding" }))
         .rejects.toMatchObject({ code: "path_escape" });
     } finally { rmSync(vaultLink, { force: true }); }
+  });
+
+  test.skipIf(!fileSymlinks)("a token file symlink is refused", async () => {
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
     const tokenLink = join(vault, "token-link");
     writeToken();
-    symlinkSync(join(vault, "resident.token"), tokenLink);
+    symlinkSync(join(vault, "resident.token"), tokenLink, "file");
     await expect(startResident(writeConfig(9, tokenLink, model))).rejects.toMatchObject({ code: "path_escape" });
-    await expect(request("search", { query: "padding", mode: "vector", allowed_ids: ["../other"], semantic: semantic(model) }))
-      .rejects.toMatchObject({ code: "invalid_ids" });
   });
 
   test("vector and rrf call the SDK directly and keep source identity", async () => {
