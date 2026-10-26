@@ -871,4 +871,95 @@ describe("One Card semantic contract", () => {
     expect(plain).not.toHaveProperty("vector_status");
     expect(Object.keys(plain.status as object).sort()).toEqual(["daysStale", "needsEmbedding", "totalDocs"]);
   });
+
+  test("inventory hashes the stored CRLF body as LF and omits a broken SDK hash", async () => {
+    const crlf = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const logical = `---\nqmd: {metadata: {permalink: "knowledge/${crlf}", card_version: "${card}", source_version: "${version}"}}\n---\n\n# heading\n\ncrlfatomtoken\n`;
+    const raw = logical.replace(/\n/g, "\r\n");
+    expect(raw).toContain("\r\n");
+    writeFileSync(join(source, crlf + ".md"), raw);
+    await request("index");
+    const searched = await request("search", { query: "crlfatomtoken", allowed_ids: [crlf], limit: 2 });
+    const searchRow = (searched.results as { id: string; sha256: string; indexed_hash: string; indexed_card_version: string; indexed_source_version: string }[])[0];
+    const rawDigest = createHash("sha256").update(raw).digest("hex");
+    const logicalDigest = createHash("sha256").update(logical).digest("hex");
+    expect(searchRow?.id).toBe(crlf);
+    expect(searchRow?.sha256).toBe(logicalDigest);
+    expect(searchRow?.indexed_hash).toBe(rawDigest);
+    expect(searchRow?.indexed_card_version).toBe(card);
+    expect(searchRow?.indexed_source_version).toBe(version);
+
+    const model = modelFile("embed.gguf", "GGUF-synthetic-fixture");
+    const verified = realpathSync(model.path);
+    const real = await openResidentStore(db, source, verified);
+    const calls: string[] = [];
+    const quiet: QMDStore = {
+      ...real,
+      close: async () => { calls.push("close"); },
+      embed: async () => { calls.push("embed"); throw new Error("embed"); },
+      update: async () => { calls.push("update"); throw new Error("update"); },
+      search: async () => { calls.push("search"); throw new Error("search"); },
+      searchLex: async () => { calls.push("searchLex"); throw new Error("searchLex"); },
+      searchVector: async () => { calls.push("searchVector"); throw new Error("searchVector"); },
+      expandQuery: async () => { calls.push("expandQuery"); throw new Error("expand"); },
+    };
+    const inventory = (store: QMDStore = quiet) => handleRequest({
+      schema_version: 1, action: "status", vault_path: vault, db_path: db,
+      include_documents: true, allowed_ids: [crlf],
+    }, { store, modelPath: verified, modelSha256: model.sha256, residency: "warm" });
+    type Row = { id: string; sha256: string; indexed_hash: string; indexed_card_version: string; indexed_source_version: string };
+    try {
+      const stored = await real.get(`qmd://${COLLECTION}/${crlf}.md`, { includeBody: true });
+      if (!stored || "error" in stored || typeof stored.body !== "string") throw new Error("Missing stored CRLF body");
+      expect(stored.body).toBe(raw);
+      expect(stored.hash).toBe(rawDigest);
+      const listed = await inventory();
+      const row = (listed.documents as Row[])[0];
+      expect(Object.keys(row ?? {}).sort()).toEqual(["id", "indexed_card_version", "indexed_hash", "indexed_source_version", "sha256"]);
+      expect(row?.sha256).toBe(logicalDigest);
+      expect(row?.indexed_hash).toBe(logicalDigest);
+      expect(row?.indexed_hash).not.toBe(stored.hash);
+      expect(row?.indexed_card_version).toBe(card);
+      expect(row?.indexed_source_version).toBe(version);
+      expect(listed.missing_ids).toEqual([]);
+
+      const nextCard = "c".repeat(64);
+      const nextVersion = "d".repeat(64);
+      const changed = logical.replace(card, nextCard).replace(version, nextVersion).replace("\ncrlfatomtoken\n", "\ncrlfatomchanged\n");
+      const changedRaw = changed.replace(/\n/g, "\r\n");
+      writeFileSync(join(source, crlf + ".md"), changedRaw);
+      const stale = await inventory();
+      const staleRow = (stale.documents as Row[])[0];
+      const changedLogical = changedRaw.replace(/\r\n/g, "\n");
+      expect(staleRow?.indexed_hash).toBe(logicalDigest);
+      expect(staleRow?.sha256).toBe(createHash("sha256").update(changedLogical).digest("hex"));
+      expect(staleRow?.sha256).not.toBe(staleRow?.indexed_hash);
+      expect(staleRow?.indexed_hash).not.toBe(createHash("sha256").update(changedRaw).digest("hex"));
+      expect(staleRow?.indexed_card_version).toBe(card);
+      expect(staleRow?.indexed_source_version).toBe(version);
+      expect(staleRow?.indexed_card_version).not.toBe(nextCard);
+      expect(staleRow?.indexed_source_version).not.toBe(nextVersion);
+      expect(JSON.stringify(stale)).not.toContain("crlfatomchanged");
+      const still = await real.get(`qmd://${COLLECTION}/${crlf}.md`, { includeBody: true });
+      if (!still || "error" in still || typeof still.body !== "string") throw new Error("Stored body disappeared");
+      expect(still.body).toBe(raw);
+      expect(still.hash).toBe(rawDigest);
+
+      const broken: QMDStore = {
+        ...quiet,
+        get: async (path, options) => {
+          const found = await real.get(path, options);
+          if (found && typeof found === "object" && !("error" in found)) return { ...found, hash: "f".repeat(64) };
+          return found;
+        },
+      };
+      const omitted = await inventory(broken);
+      expect(omitted.documents).toEqual([]);
+      expect(omitted.missing_ids).toEqual([crlf]);
+      expect(JSON.stringify(omitted)).not.toContain("crlfatomtoken");
+      expect(JSON.stringify(omitted)).not.toContain(rawDigest);
+      for (const name of ["embed", "update", "search", "searchLex", "searchVector", "expandQuery", "close"])
+        expect(calls).not.toContain(name);
+    } finally { await real.close(); }
+  });
 });

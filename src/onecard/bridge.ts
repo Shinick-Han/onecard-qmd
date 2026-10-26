@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { createStore, type HybridQueryResult, type MetadataFilter, type QMDStore, type SearchResult } from "../index.js";
 import { extractDocumentMetadata } from "../metadata.js";
+import { hashContent } from "../store.js";
 import { METADATA_FILTER_LIMITS } from "../metadata-filter.js";
 
 export const UPSTREAM_COMMIT = "86d2365d17fc682e491c2c53d1e4a884aee8682a";
@@ -318,6 +319,9 @@ async function inventoryDocument(store: QMDStore, vault: string, source: string,
   if (!indexed || typeof indexed !== "object" || "error" in indexed || typeof indexed.body !== "string") return undefined;
   if (indexed.collectionName !== COLLECTION || basename(indexed.displayPath) !== id + ".md" || indexed.hash !== preview.hash) return undefined;
   if (Buffer.byteLength(indexed.body) > ATOM_BODY_BYTES) return undefined;
+  if (await hashContent(indexed.body) !== indexed.hash) return undefined;
+  const canonical = indexed.body.replace(/\r\n/g, "\n");
+  if (Buffer.byteLength(canonical) > ATOM_BODY_BYTES) return undefined;
   const extracted = extractDocumentMetadata(indexed.body, id + ".md");
   if (extracted.error) return undefined;
   const card = extracted.metadata.card_version;
@@ -327,7 +331,7 @@ async function inventoryDocument(store: QMDStore, vault: string, source: string,
   return {
     id,
     sha256,
-    indexed_hash: indexed.hash,
+    indexed_hash: await hashContent(canonical),
     indexed_card_version: card,
     indexed_source_version: version,
   };
