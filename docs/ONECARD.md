@@ -12,8 +12,9 @@ worker per call. These are caller-side changes, not replacements for QMD search.
 ## Boundary
 
 - `src/onecard/bridge.ts`: adapter over the SDK. `lexical`, `vector`, and `rrf`
-  use the query as written. `full` calls upstream `store.search` with expansion
-  and reranking. No custom ranking and no direct database writes.
+  use the query as written. `full` calls upstream `store.search` with rerank on.
+  A strong BM25 hit can skip expansion, so rewriting is not guaranteed. No custom
+  ranking and no direct database writes.
 - `src/onecard/cli.ts`: one JSON request on stdin, or `--serve --config` for the
   loopback resident. A query does not embed the corpus, download a model, or
   start that process.
@@ -59,14 +60,17 @@ request. `auto` is not a config value. `hybrid` fails with `mode_unavailable`.
 - `lexical`: `searchLex` of the query as written.
 - `vector`: `searchVector` of that same query, without expansion or rerank.
 - `rrf`: lex plus vector fusion of that same query with rerank off.
-- `full`: `store.search({ query, rerank: true })`, the upstream expansion and
-  rerank pipeline. Scores stay that pipeline's native scores.
+- `full`: `store.search({ query, rerank: true })`. Upstream expansion plus rerank
+  is conditional; a strong BM25 hit can skip rewriting. Scores stay that
+  pipeline's native scores.
 
 `vector`, `rrf`, and `full` require current embeddings. Semantic config may add
 only `expansion_model` and `rerank_model`, together. `full` needs both; a missing
 pin is `quality_models_missing`, not a lexical fallback. Maintenance settings
-belong in `qmd-maintenance.json`, not in semantic keys. Real GGUF inference was
-not run here.
+belong in `qmd-maintenance.json`, not in semantic keys. A separate private
+snapshot confirmed vector, RRF, and full GGUF inference for three preselected
+queries, without production activation. Those queries, model paths, and data
+are not recorded here.
 
 ## Updating and validating
 

@@ -17,7 +17,8 @@ Upstream search, indexing, and model code are unchanged. The upstream pin remain
 is `full`. The parent resolves its configured default before the request.
 `mode: "hybrid"` is rejected with `mode_unavailable`. RRF is lex plus vector
 fusion of the original query only. It is not QMD's full hybrid pipeline. `full`
-is that upstream pipeline, including its expansion and reranking.
+is that upstream pipeline: conditional expansion plus rerank. A strong BM25 hit
+can skip rewriting, so expansion is not guaranteed for every query.
 
 Scores are the SDK's native relevance values. They are not truth or confidence.
 Every mode keeps the current-document allow list, collection identity check,
@@ -156,10 +157,12 @@ already open. Those timings are not averaged together.
 - full: `store.search` with the original `query`, `rerank: true`, `collection`,
   `filter`, and `limit`. The adapter does not pass `queries` or `intent`.
 
-Vector, RRF, and full therefore use the SDK's query embedding, and full also
-uses its local expansion and rerank models. That is not `store.embed`, not an
-index update, and not a remote model call. If the index has no current
-embeddings, the adapter returns `embeddings_missing` before that call. Every
+Vector, RRF, and full therefore use the SDK's query embedding. `full` uses the
+local expansion model only when upstream does not take the strong-BM25 bypass,
+and uses the local rerank model when that pipeline reranks. That is not
+`store.embed`, not an index update, and not a remote model call. If the index
+has no current embeddings, the adapter returns `embeddings_missing` before that
+call. Every
 semantic mode keeps the current-document allow list.
 
 ## Gaps
@@ -175,9 +178,10 @@ These are limits of the unchanged SDK, not success states:
   choosing `default_mode` itself. Native `auto` stays lexical.
 - `createStore` can unload a model after five minutes without calls. The
   resident process keeps the store object; it cannot change that timer.
-- A GGUF header and SHA-256 are checked locally. Loading embed, expansion, or
-  rerank weights was not run, so inference and `full` retrieval quality are
-  unverified.
+- A GGUF header and SHA-256 are checked locally. A separate private snapshot
+  confirmed vector, RRF, and full GGUF inference for three preselected queries.
+  That run did not activate production. The queries, model paths, and data are
+  not recorded here. A strong BM25 hit can still skip expansion.
 - `remote_model_calls` is 0 because this adapter never selects an `hf:` or URL
   model. Traffic was not captured.
 - `docs/ONECARD.md` and `skills/onecard` still describe lexical-only use. They
