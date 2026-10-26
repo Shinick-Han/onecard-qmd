@@ -105,7 +105,7 @@ Missing pieces are errors, not empty success:
 | Index database absent | `index_missing` |
 | Resident process is down | `server_unavailable` |
 | `status` `include_documents` outside the resident pin | `semantic_unconfigured` |
-| Document inventory IDs missing, empty, or over 256 | `invalid_ids` |
+| Document inventory IDs missing, empty, duplicated, or over 256 | `invalid_ids` |
 
 ## Resident server
 
@@ -119,18 +119,31 @@ port. The parent owns the process lifetime and any Windows token ACL.
   path, a body over 1 MiB, or a different vault are rejected.
 - HTTP allows only `search` and `status`. `index` and `embed` stay stdin actions.
 - `status` with `include_documents: true` is resident-only and requires `allowed_ids`
-  of 1 to 256 current UUIDs, deduplicated. It adds `embed_model_sha256`,
-  `vectors_ready`, `documents`, and `missing_ids` beside the existing `status`.
-  `vectors_ready` is true only when `getStatus` reports documents, zero
-  `needsEmbedding` for the pinned embed model, and `hasVectorIndex`. An empty
-  index is not ready. Each document row is `{id, sha256, indexed_hash,
+  of 1 to 256 unique current UUIDs. A repeated UUID is `invalid_ids`. Search
+  allowlists still deduplicate and keep their own limit. Inventory adds
+  `embed_model_sha256`, `vectors_ready`, `vector_status`, `documents`, and
+  `missing_ids` beside the existing `status`. `vector_status` is exactly
+  `{needsEmbedding, hasVectorIndex, totalDocuments}` from `getStatus` for the
+  pinned embed model. `vectors_ready` is true exactly when that object has
+  `totalDocuments > 0`, `needsEmbedding === 0`, and `hasVectorIndex`. An empty
+  index is not ready. Collections, paths, bodies, and the rest of `getStatus`
+  are not copied. Each document row is `{id, sha256, indexed_hash,
   indexed_card_version, indexed_source_version}`. `sha256` is the current
   LF-normalized vault file. `indexed_hash` and the indexed versions come from
   `store.get(qmd://one-card-atoms/ID.md, {includeBody:true})` and
   `extractDocumentMetadata` on that stored body. A stale file keeps the indexed
   values. Missing, oversized (above 1 MiB), or identity-mismatched IDs are
-  listed in `missing_ids` with no title, body, or path. This call does not
-  search, embed, download, or start anything. Plain `status` omits these fields.
+  listed in `missing_ids` with no title, body, or path. Identity is `permalink`
+  exactly `knowledge/<id>`, the same field search allowlists filter.
+  `docs/ONECARD.md` describes generated `qmd.metadata` as permalink,
+  card_version, source_version, language, and review_status. The adapter
+  fixtures write permalink, card_version, and source_version, plus
+  review_status when set. Those notes do not contain `onecard_id`.
+  `extractDocumentMetadata` keeps every valid metadata key and does not remove
+  `onecard_id`; inventory does not read that key. This call does not
+  search, embed, download, or start anything. Plain `status` is `getIndexHealth`
+  (`needsEmbedding`, `totalDocs`, `daysStale`) and omits `hasVectorIndex` and
+  these inventory fields.
 - The process keeps one SDK store and runs requests one at a time. A vector-only
   config opens it with `models.embed`. When both quality pins exist, startup
   verifies all three SHA-256 digests and GGUF headers, then opens the store with
