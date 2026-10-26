@@ -129,11 +129,17 @@ port. The parent owns the process lifetime and any Windows token ACL.
   index is not ready. Collections, paths, bodies, and the rest of `getStatus`
   are not copied. Each document row is `{id, sha256, indexed_hash,
   indexed_card_version, indexed_source_version}`. `sha256` is the current
-  LF-normalized vault file. `indexed_hash` and the indexed versions come from
-  `store.get(qmd://one-card-atoms/ID.md, {includeBody:true})` and
-  `extractDocumentMetadata` on that stored body. A stale file keeps the indexed
-  values. Missing, oversized (above 1 MiB), or identity-mismatched IDs are
-  listed in `missing_ids` with no title, body, or path. Identity is `permalink`
+  LF-normalized vault file. `indexed_hash` is the SHA-256 of the stored body
+  from `store.get(qmd://one-card-atoms/ID.md, {includeBody:true})` after CRLF
+  is normalized to LF, using the SDK `hashContent` function. That digest is
+  returned only when `hashContent` of the raw stored body equals the SDK
+  document hash; otherwise the ID is omitted. The current file hash is never
+  copied into `indexed_hash`. Indexed card and source versions come from
+  `extractDocumentMetadata` on that same stored body. A changed file keeps
+  those indexed hash and version values. Search rows are unchanged and still
+  report the SDK content hash. Missing, oversized (above 1 MiB),
+  identity-mismatched, or stored-hash-mismatched IDs are listed in
+  `missing_ids` with no title, body, or path. Identity is `permalink`
   exactly `knowledge/<id>`, the same field search allowlists filter.
   `docs/ONECARD.md` describes generated `qmd.metadata` as permalink,
   card_version, source_version, language, and review_status. The adapter
