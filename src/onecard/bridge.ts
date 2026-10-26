@@ -386,11 +386,14 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
     if (!Array.isArray(request.allowed_ids) || request.allowed_ids.length > idLimit || (includeDocuments && request.allowed_ids.length === 0))
       fail("invalid_ids", "Invalid current document IDs.");
     const ids: string[] = [];
+    const seen = new Set<string>();
     for (const id of request.allowed_ids) {
       if (typeof id !== "string" || !UUID.test(id)) fail("invalid_ids", "Invalid current document IDs.");
+      if (includeDocuments && seen.has(id)) fail("invalid_ids", "Invalid current document IDs.");
+      seen.add(id);
       ids.push(id);
     }
-    allowed = [...new Set(ids)];
+    allowed = [...seen];
   }
   let query = "";
   let limit = 12;
@@ -460,6 +463,11 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
       if (!session?.store || !session.modelSha256)
         fail("semantic_unconfigured", "Document inventory requires the resident pinned embed model.");
       const modelHealth = await store.getStatus();
+      const vectorStatus = {
+        needsEmbedding: modelHealth.needsEmbedding,
+        hasVectorIndex: modelHealth.hasVectorIndex,
+        totalDocuments: modelHealth.totalDocuments,
+      };
       const documents = [];
       const missingIds = [];
       for (const id of allowed ?? []) {
@@ -470,7 +478,8 @@ export async function handleRequest(value: unknown, session?: StoreSession): Pro
       return finish(action, "lexical", {
         status,
         embed_model_sha256: session.modelSha256,
-        vectors_ready: modelHealth.totalDocuments > 0 && modelHealth.needsEmbedding === 0 && modelHealth.hasVectorIndex,
+        vectors_ready: vectorStatus.totalDocuments > 0 && vectorStatus.needsEmbedding === 0 && vectorStatus.hasVectorIndex,
+        vector_status: vectorStatus,
         documents,
         missing_ids: missingIds,
       }, residency, started);

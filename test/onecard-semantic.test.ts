@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { COLLECTION, UPSTREAM_COMMIT, handleRequest, openResidentStore, type StoreSession } from "../src/onecard/bridge.js";
+import { extractDocumentMetadata } from "../src/metadata.js";
 import { callResident, startResident, type Resident } from "../src/onecard/server.js";
 import type { QMDStore, SearchResult } from "../src/index.js";
 
@@ -661,9 +662,12 @@ describe("One Card semantic contract", () => {
     const oversize = "55555555-5555-4555-8555-555555555555";
     const broken = "77777777-7777-4777-8777-777777777777";
     const grown = "88888888-8888-4888-8888-888888888888";
-    note(mismatch, "foreign permalink body");
-    const mismatchPath = join(source, mismatch + ".md");
-    writeFileSync(mismatchPath, readFileSync(mismatchPath, "utf8").replace(`knowledge/${mismatch}`, `knowledge/${one}`));
+    const alias = "99999999-9999-4999-8999-999999999999";
+    const otherId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    writeFileSync(join(source, mismatch + ".md"),
+      `---\nqmd: {metadata: {permalink: "knowledge/${one}", onecard_id: "${mismatch}", card_version: "${card}", source_version: "${version}"}}\n---\n\n# foreign permalink body\n\nforeign permalink body\n`);
+    writeFileSync(join(source, alias + ".md"),
+      `---\nqmd: {metadata: {permalink: "knowledge/${alias}", onecard_id: "${otherId}", card_version: "${card}", source_version: "${version}"}}\n---\n\n# alias note\n`);
     writeFileSync(join(source, broken + ".md"),
       `---\nqmd: {metadata: {permalink: "knowledge/${broken}", card_version: "nope", source_version: "${version}"}}\n---\n\n# broken meta\n`);
     note(grown, "small atom");
@@ -673,6 +677,8 @@ describe("One Card semantic contract", () => {
     const stdinStatus = await request("status");
     expect(Object.keys(stdinStatus).sort()).toEqual(["action", "engine", "latency_ms", "residency", "schema_version", "status"]);
     expect((await request("search", { query: "padding", allowed_ids: [] })).results).toEqual([]);
+    const duplicateSearch = await request("search", { query: "padding", allowed_ids: [two, two], limit: 2 });
+    expect((duplicateSearch.results as { id: string }[]).map(row => row.id)).toEqual([two]);
     await expect(request("status", { include_documents: true, allowed_ids: [one] })).rejects.toMatchObject({ code: "semantic_unconfigured" });
     await expect(handleRequest({
       schema_version: 1, action: "status", vault_path: vault, db_path: db,
@@ -725,6 +731,9 @@ describe("One Card semantic contract", () => {
       expect(Object.keys(plain).sort()).toEqual(["action", "engine", "latency_ms", "residency", "schema_version", "status"]);
       expect(plain.status).toEqual(stdinStatus.status);
       expect(plain.status).toEqual(await real.getIndexHealth());
+      expect(Object.keys(plain.status as object).sort()).toEqual(["daysStale", "needsEmbedding", "totalDocs"]);
+      expect(plain).not.toHaveProperty("vector_status");
+      expect(plain).not.toHaveProperty("hasVectorIndex");
       await expect(handleRequest({
         schema_version: 1, action: "status", vault_path: vault, db_path: db,
         include_documents: true, allowed_ids: [one],
@@ -739,25 +748,47 @@ describe("One Card semantic contract", () => {
       }, session(real))).rejects.toMatchObject({ code: "invalid_request" });
 
       const repeated = Array.from({ length: 256 }, () => one);
-      await expect(inventoryRequest(real, [...repeated, one])).rejects.toMatchObject({ code: "invalid_ids" });
+      await expect(inventoryRequest(real, repeated)).rejects.toMatchObject({ code: "invalid_ids" });
+      await expect(inventoryRequest(real, [one, one])).rejects.toMatchObject({ code: "invalid_ids" });
       await expect(inventoryRequest(real, [])).rejects.toMatchObject({ code: "invalid_ids" });
       await expect(handleRequest({
         schema_version: 1, action: "status", vault_path: vault, db_path: db, include_documents: true,
       }, session(real))).rejects.toMatchObject({ code: "invalid_ids" });
       await expect(inventoryRequest(real, ["../other"])).rejects.toMatchObject({ code: "invalid_ids" });
-
-      const deduped = await inventoryRequest(tracking, repeated);
-      expect((deduped.documents as Row[]).map(row => row.id)).toEqual([one]);
-      expect(deduped.missing_ids).toEqual([]);
+      const unique = Array.from({ length: 255 }, (_, index) =>
+        `66666666-6666-4666-8666-${index.toString(16).padStart(12, "0")}`);
+      await expect(inventoryRequest(real, [...unique, two, one])).rejects.toMatchObject({ code: "invalid_ids" });
+      const bounded = await inventoryRequest(tracking, [...unique, one]);
+      expect((bounded.documents as Row[]).map(row => row.id)).toEqual([one]);
+      expect(bounded.missing_ids).toEqual(unique);
 
       writeFileSync(join(source, grown + ".md"), "x".repeat(1024 * 1024 + 1));
       const beforeTwo = readFileSync(join(source, two + ".md"), "utf8").replace(/\r\n/g, "\n");
-      const listed = await inventoryRequest(tracking, [one, absent, one, mismatch, broken, grown, oversize, two]);
+      const kept = extractDocumentMetadata(readFileSync(join(source, alias + ".md"), "utf8"), alias + ".md");
+      const redirected = extractDocumentMetadata(readFileSync(join(source, mismatch + ".md"), "utf8"), mismatch + ".md");
+      expect(kept.error).toBeUndefined();
+      expect(kept.metadata.permalink).toBe(`knowledge/${alias}`);
+      expect(kept.metadata.onecard_id).toBe(otherId);
+      expect(redirected.metadata.permalink).toBe(`knowledge/${one}`);
+      expect(redirected.metadata.onecard_id).toBe(mismatch);
+      const listed = await inventoryRequest(tracking, [one, absent, mismatch, broken, grown, oversize, two, alias, otherId]);
       const documents = listed.documents as Row[];
-      expect(documents.map(row => row.id)).toEqual([one, two]);
-      expect(listed.missing_ids).toEqual([absent, mismatch, broken, grown, oversize]);
+      expect(documents.map(row => row.id)).toEqual([one, two, alias]);
+      expect(Object.keys(documents[2] ?? {}).sort()).toEqual(["id", "indexed_card_version", "indexed_hash", "indexed_source_version", "sha256"]);
+      expect(listed.missing_ids).toEqual([absent, mismatch, broken, grown, oversize, otherId]);
       expect(listed.embed_model_sha256).toBe(model.sha256);
+      const vectorStatus = listed.vector_status as { needsEmbedding: number; hasVectorIndex: boolean; totalDocuments: number };
+      expect(Object.keys(vectorStatus).sort()).toEqual(["hasVectorIndex", "needsEmbedding", "totalDocuments"]);
+      expect(vectorStatus).toEqual({
+        needsEmbedding: (await real.getStatus()).needsEmbedding,
+        hasVectorIndex: (await real.getStatus()).hasVectorIndex,
+        totalDocuments: (await real.getStatus()).totalDocuments,
+      });
+      expect(listed.vectors_ready).toBe(vectorStatus.totalDocuments > 0 && vectorStatus.needsEmbedding === 0 && vectorStatus.hasVectorIndex);
       expect(listed.vectors_ready).toBe(false);
+      expect(listed).not.toHaveProperty("collections");
+      expect(vectorStatus).not.toHaveProperty("collections");
+      expect(vectorStatus).not.toHaveProperty("pendingMetadata");
       expect(listed.residency).toBe("warm");
       expect((listed.engine as { mode: string; remote_model_calls: number }).mode).toBe("lexical");
       expect((listed.engine as { remote_model_calls: number }).remote_model_calls).toBe(0);
@@ -775,7 +806,7 @@ describe("One Card semantic contract", () => {
       expect(indexed.indexed_card_version).toBe(card);
       expect(bodyGets.some(path => path.includes(oversize) || path.includes(absent) || path.includes(grown))).toBe(false);
       const encoded = JSON.stringify(listed);
-      for (const secret of ["padding", "foreign permalink", "broken meta", "hidden oversize", "nope", vault, "AgentNotes", model.path])
+      for (const secret of ["padding", "foreign permalink", "broken meta", "hidden oversize", "alias note", "nope", vault, "AgentNotes", model.path, "collections"])
         expect(encoded).not.toContain(secret);
 
       const staleCard = "c".repeat(64);
@@ -798,7 +829,10 @@ describe("One Card semantic contract", () => {
           getStatus: async () => ({ ...status, pendingMetadata: 0, collections: [] }),
         };
         const response = await inventoryRequest(wrapped, [one]);
-        return response.vectors_ready;
+        expect(response.vector_status).toEqual(status);
+        expect(Object.keys(response.vector_status as object).sort()).toEqual(["hasVectorIndex", "needsEmbedding", "totalDocuments"]);
+        return response.vectors_ready === (status.totalDocuments > 0 && status.needsEmbedding === 0 && status.hasVectorIndex)
+          ? response.vectors_ready : "inconsistent";
       };
       expect(await health({ totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: true })).toBe(false);
       expect(await health({ totalDocuments: 2, needsEmbedding: 1, hasVectorIndex: true })).toBe(false);
@@ -820,8 +854,11 @@ describe("One Card semantic contract", () => {
     });
     const row = (body.documents as { id: string; sha256: string; indexed_hash: string }[])[0];
     const current = readFileSync(join(source, one + ".md"), "utf8").replace(/\r\n/g, "\n");
+    const vectorStatus = body.vector_status as { needsEmbedding: number; hasVectorIndex: boolean; totalDocuments: number };
+    expect(Object.keys(vectorStatus).sort()).toEqual(["hasVectorIndex", "needsEmbedding", "totalDocuments"]);
     expect(body.embed_model_sha256).toBe(model.sha256);
-    expect(body.vectors_ready).toBe(false);
+    expect(body.vectors_ready).toBe(vectorStatus.totalDocuments > 0 && vectorStatus.needsEmbedding === 0 && vectorStatus.hasVectorIndex);
+    expect(body).not.toHaveProperty("collections");
     expect(row?.id).toBe(one);
     expect(row?.sha256).toBe(createHash("sha256").update(current).digest("hex"));
     expect(body.missing_ids).toEqual([absent]);
@@ -831,5 +868,7 @@ describe("One Card semantic contract", () => {
       schema_version: 1, action: "status", vault_path: vault, db_path: db,
     });
     expect(Object.keys(plain).sort()).toEqual(["action", "engine", "latency_ms", "residency", "schema_version", "status"]);
+    expect(plain).not.toHaveProperty("vector_status");
+    expect(Object.keys(plain.status as object).sort()).toEqual(["daysStale", "needsEmbedding", "totalDocs"]);
   });
 });
